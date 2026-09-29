@@ -1,0 +1,19 @@
+# Entorno virtual de Python
+.venv/
+venv/
+
+# Archivos temporales de Python
+__pycache__/
+*.pyc
+
+# Secretos: NUNCA subas tu API key a GitHub
+.env
+.streamlit/secrets.toml
+
+# Archivos del sistema / editor
+.directory
+.DS_Store
+.idea/
+.vscode/
+# Configuración local de herramientas
+.claude/
