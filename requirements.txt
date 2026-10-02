@@ -1,6 +1,6 @@
-# Interfaz web educativa (los 3 paneles)
+# Interfaz web educativa (laboratorio de 3 paneles + página de teoría)
 streamlit>=1.64.0
-# SDK oficial para hablar con los modelos Claude (Prompt Caching, structured outputs)
-anthropic>=1.9.0
+# Cliente oficial de Ollama: habla con los modelos que corren en tu computadora
+ollama>=0.6.0
 # Para extraer el texto de archivos PDF
 pypdf>=6.0.0

@@ -2,6 +2,8 @@
 cag_core.py — El corazón del sistema CAG (Cache-Augmented Generation)
 ======================================================================
 
+Todo corre en TU computadora con Ollama: gratis, privado y sin internet.
+
 🎓 LA ANALOGÍA CENTRAL
 ----------------------
 Imagina un examen:
@@ -15,39 +17,35 @@ Imagina un examen:
     ANTES del examen para que lo memorice. Cuando llega la pregunta, la
     respuesta ya está en su cabeza: no hay búsqueda y no hay página equivocada.
 
-¿Y la "caché"? Leer un libro entero cada vez cuesta tiempo y dinero. El
-"Prompt Caching" de Anthropic permite que el modelo lo "lea" una sola vez: el
-servidor guarda el trabajo ya hecho (lo que técnicamente se llama KV Cache) y
-las siguientes preguntas lo reutilizan. Es como un estudiante con memoria
-fotográfica: lee el libro una vez y después solo lo "recuerda".
+¿Y la "caché"? Para "leer" un texto, el modelo calcula para cada token unas
+notas internas llamadas claves y valores (Keys y Values). Guardarlas es la
+"caché KV": son los apuntes del estudiante. Ollama las conserva en la memoria
+de tu tarjeta gráfica, así que si la siguiente pregunta empieza con el mismo
+libro, el modelo NO lo vuelve a leer: consulta sus apuntes.
 
 🧩 CÓMO FLUYE LA INFORMACIÓN EN ESTE ARCHIVO
 --------------------------------------------
-  1. MotorCAG.cargar_conocimiento() → junta tus documentos en un solo bloque de
-     texto (`conocimiento_en_cache`), cuenta sus tokens y "precalienta" la
-     caché del servidor.
+  1. MotorCAG.cargar_conocimiento() → junta tus documentos en un solo bloque
+     (`conocimiento_en_cache`), calcula qué tan grande debe ser la "mesa de
+     estudio" (num_ctx) y precalienta la caché leyendo el libro una vez.
   2. MotorCAG.preguntar_en_vivo()  → envía [conocimiento + instrucciones +
      pregunta] y devuelve la respuesta palabra por palabra (streaming).
-  3. RespuestaCAG                   → la respuesta final más su "recibo":
-     cuántos tokens salieron de la caché y cuánto costó (y cuánto habría
-     costado sin caché).
+  3. RespuestaCAG                   → la respuesta final más sus "tiempos":
+     cuánto tardó en leer el prompt y cuánto habría tardado sin caché.
 
-📏 LA REGLA DE ORO DEL PROMPT CACHING
-------------------------------------
-La caché funciona por PREFIJO: el servidor compara tu petición byte por byte
-desde el principio. Si el inicio es idéntico al de una petición anterior,
-reutiliza ese trabajo. Por eso el conocimiento va SIEMPRE primero y nunca
-cambia, y lo que sí cambia (instrucciones, preguntas) va DESPUÉS.
+📏 LA REGLA DE ORO DE LA CACHÉ: EL PREFIJO
+-----------------------------------------
+Las notas de cada token dependen de TODOS los tokens anteriores. Por eso solo
+se pueden reutilizar si el INICIO del prompt es idéntico al de antes. Así que
+el conocimiento va SIEMPRE primero y nunca cambia, y lo que sí cambia
+(instrucciones, preguntas) va DESPUÉS.
 
     ┌───────────────────────────────────┬───────────────┬──────────────┐
     │ 📚 Conocimiento (siempre idéntico) │ Instrucciones │   Pregunta   │
     └───────────────────────────────────┴───────────────┴──────────────┘
-                                        ▲
-             aquí va la "marca de caché": el servidor guarda todo lo
-             que está a su izquierda para reutilizarlo en la siguiente
-             pregunta.
+      ▲ esto se reutiliza de la caché     ▲ se lee cada vez (es corto)
 
-Pruébalo desde la terminal (necesitas la variable ANTHROPIC_API_KEY):
+Pruébalo desde la terminal (con Ollama encendido):
 
     python cag_core.py
 """
@@ -55,75 +53,53 @@ Pruébalo desde la terminal (necesitas la variable ANTHROPIC_API_KEY):
 from __future__ import annotations
 
 import io
+import math
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
-import anthropic
+import ollama
 
 # ════════════════════════════════════════════════════════════════════════════
 # ⚙️ CONFIGURACIÓN
 # ════════════════════════════════════════════════════════════════════════════
 
-# El modelo que "memoriza" el conocimiento y responde. Puedes cambiarlo con la
-# variable de entorno CAG_MODELO sin tocar el código.
-MODELO = os.environ.get("CAG_MODELO", "claude-opus-5-5")
+# El modelo local que "memoriza" el conocimiento y responde. gpt-oss:20b fue el
+# que mejor equilibró precisión, velocidad y calidad como juez en nuestras
+# pruebas con una GPU de 16 GB. Puedes elegir otro en la app o con CAG_MODELO.
+MODELO_RECOMENDADO = os.environ.get("CAG_MODELO", "gpt-oss:20b")
 
-# La "mesa de estudio" del modelo: cuántos tokens caben a la vez en su memoria
-# de trabajo (ventana de contexto). Un token es un pedacito de palabra
-# (≈ 4 caracteres en español). 1,000,000 de tokens ≈ 10 novelas largas.
-VENTANA_DE_CONTEXTO_TOKENS = 1_000_000
+# La "mesa de estudio" (ventana de contexto, `num_ctx` en Ollama) es cuánto
+# texto cabe a la vez en la memoria de trabajo del modelo. Una mesa más grande
+# ocupa más memoria de la tarjeta gráfica (VRAM): con 16 GB, gpt-oss:20b cabe
+# completo en la GPU hasta 65,536 tokens; con más, empieza a usar la CPU y se
+# vuelve lento. Ajústalo a tu equipo con la variable CAG_NUM_CTX_MAXIMO.
+NUM_CTX_MAXIMO = int(os.environ.get("CAG_NUM_CTX_MAXIMO", "65536"))
 
-# No llenamos la mesa hasta el borde: dejamos espacio para la conversación y la
-# respuesta. Si tus documentos no caben aquí, CAG deja de ser la herramienta
-# adecuada y conviene usar RAG (buscar solo los fragmentos necesarios).
-LIMITE_SEGURO_DE_CONOCIMIENTO = 900_000
+# Espacio que dejamos libre en la mesa para la conversación, el razonamiento
+# interno del modelo y su respuesta.
+MARGEN_PARA_CONVERSACION = 8_192
 
-# El servidor no se molesta en guardar en caché textos muy cortos: por debajo de
-# este tamaño la "marca de caché" se ignora sin avisar (no hay error, pero
-# tampoco hay ahorro). 512 tokens es el mínimo para claude-opus-5-5.
-MINIMO_TOKENS_PARA_CACHE = 512
+# Para elegir el tamaño de la mesa ANTES de leer el libro, estimamos sus tokens.
+# En español un token suele ser de 3 a 4 caracteres; suponemos 2.5 para
+# quedarnos del lado seguro (es mejor que sobre mesa a que falte).
+CARACTERES_POR_TOKEN_PESIMISTA = 2.5
 
-# Cuánto "se esfuerza" el modelo en pensar antes de responder:
-# "low" | "medium" | "high" | "xhigh" | "max". Más esfuerzo = más calidad en
-# problemas difíciles, pero más lento y caro. Usamos el MISMO valor en todas las
-# llamadas porque cambiarlo entre peticiones puede invalidar la caché.
-ESFUERZO = "medium"
+# 0 = respuestas reproducibles: la misma pregunta da la misma respuesta.
+TEMPERATURA = 0
 
-# El modelo siempre razona internamente antes de contestar. Con
-# "summarized" nos devuelve un RESUMEN legible de ese razonamiento, que
-# mostramos en el panel de transparencia. También es idéntico en todas las
-# llamadas, por la misma razón que ESFUERZO.
-PENSAMIENTO = {"type": "adaptive", "display": "summarized"}
+# Cuánto tiempo mantiene Ollama el modelo (y su caché) en memoria desde la
+# última pregunta. Al pasar ese tiempo lo descarga y la caché se pierde.
+DURACIONES_DE_CACHE = {"10m": "10 minutos", "1h": "1 hora"}
 
-# Límite de longitud de cada respuesta (en tokens de salida, razonamiento
-# interno incluido).
-MAX_TOKENS_RESPUESTA = 16_000
+# Margen al comparar tamaños de prompt para detectar recortes (ver RespuestaEnVivo).
+TOLERANCIA_DE_TOKENS = 256
 
-# 🛟 Red de seguridad: los filtros de seguridad del modelo pueden rechazar una
-# petición (a veces por error). Con `fallbacks="default"` el propio servidor
-# reintenta con un modelo de respaldo recomendado por Anthropic, en la misma
-# llamada, en vez de devolvernos un rechazo. Requiere esta cabecera "beta".
-BETAS = ["server-side-fallback-2026-07-01"]
-RESPALDO_EN_SERVIDOR = "default"
-
-# Cuánto tiempo guarda el servidor la caché desde su último uso.
-DURACIONES_DE_CACHE = {"5m": "5 minutos", "1h": "1 hora"}
-
-# Precios en dólares por cada MILLÓN de tokens (claude-opus-5-5, sept. 2026).
-# Leer de la caché cuesta 20 veces menos que leer "en frío": ahí está el ahorro.
-# Escribir en la caché cuesta un poco más que leer normal (es la "inversión").
-PRECIOS_USD_POR_MILLON = {
-    "claude-opus-5-5": {
-        "entrada": 4.00,  # tokens leídos sin caché
-        "salida": 20.00,  # tokens generados (incluye el razonamiento interno)
-        "lectura_cache": 0.20,  # tokens recuperados de la caché
-        "escritura_cache_5m": 5.00,  # guardar en caché por 5 minutos (1.25×)
-        "escritura_cache_1h": 8.00,  # guardar en caché por 1 hora (2×)
-    },
-}
+# Para la proyección educativa: "¿cuánto tardaría en releer un libro grande?"
+TOKENS_DE_UN_LIBRO_GRANDE = 100_000
 
 # ════════════════════════════════════════════════════════════════════════════
 # 🗣️ INSTRUCCIONES PARA EL MODELO
@@ -139,9 +115,8 @@ Reglas:
 - Responde solo con información que esté en esos documentos. No uses tu \
 conocimiento general ni supongas datos que no aparecen.
 - Si la respuesta no está en los documentos, dilo con claridad (por ejemplo: \
-"Esa información no aparece en los documentos cargados") y, si ayuda, menciona \
-qué temas sí cubren.
-- Cuando sea útil, indica de qué documento o sección sale el dato.
+"Esa información no aparece en los documentos cargados").
+- Cuando sea útil, indica de qué sección sale el dato.
 - Responde en el mismo idioma de la pregunta, de forma clara y breve."""
 
 # Este modo existe para EXPERIMENTAR: le damos permiso al modelo de usar lo que
@@ -171,66 +146,67 @@ class Documento:
 
 
 @dataclass
-class ReciboDeTokens:
-    """
-    El "recibo" de una llamada al modelo: de dónde salió cada token de entrada
-    y cuántos tokens generó. Con él calculamos el costo y el ahorro.
+class ModeloLocal:
+    """La "ficha técnica" de un modelo instalado en Ollama."""
 
-    Analogía: en una fotocopiadora, imprimir el original la primera vez es caro
-    (escribir en caché); las copias siguientes son baratísimas (leer de caché).
+    nombre: str  # p. ej. "gpt-oss:20b"
+    familia: str  # p. ej. "gptoss", "gemma4"
+    tamano: str  # número de parámetros, p. ej. "20.9B"
+    cuantizacion: str  # cómo se comprimieron sus números, p. ej. "Q4_K_M"
+    contexto_maximo: int  # la mesa más grande que el modelo admite
+    soporta_razonamiento: bool  # ¿puede "pensar" antes de responder?
+
+
+@dataclass
+class MedicionDeTiempos:
+    """
+    El "cronómetro" de una llamada al modelo. Ollama nos dice cuánto tardó en
+    cada fase; con eso vemos la caché en acción.
+
+    Analogía: leer el libro entero toma minutos; consultar tus apuntes, segundos.
+    Si el tiempo de lectura es diminuto, el modelo usó sus apuntes (la caché).
     """
 
-    leidos_de_cache: int  # tokens que el servidor ya tenía "memorizados"
-    escritos_en_cache: int  # tokens que el servidor acaba de "memorizar"
-    sin_cache: int  # tokens procesados desde cero (p. ej. tu pregunta)
-    de_salida: int  # tokens generados: razonamiento interno + respuesta
-    duracion_cache: str  # "5m" o "1h" (cambia el precio de escritura)
+    tokens_del_prompt: int  # todo lo que se le envió: libro + instrucciones + pregunta
+    segundos_leyendo: float  # cuánto tardó en procesar (leer) ese prompt
+    tokens_generados: int  # lo que escribió: razonamiento interno + respuesta
+    segundos_generando: float
+    segundos_cargando_modelo: float  # > 0 si tuvo que cargar el modelo en memoria
 
     @classmethod
-    def desde_uso(cls, uso, duracion_cache: str) -> "ReciboDeTokens":
-        """Traduce el objeto `usage` que devuelve la API a nuestro recibo."""
+    def desde_respuesta(cls, respuesta) -> "MedicionDeTiempos":
+        """Traduce los campos de Ollama (en nanosegundos) a segundos."""
         return cls(
-            leidos_de_cache=uso.cache_read_input_tokens or 0,
-            escritos_en_cache=uso.cache_creation_input_tokens or 0,
-            sin_cache=uso.input_tokens,
-            de_salida=uso.output_tokens,
-            duracion_cache=duracion_cache,
+            tokens_del_prompt=respuesta.prompt_eval_count or 0,
+            segundos_leyendo=(respuesta.prompt_eval_duration or 0) / 1e9,
+            tokens_generados=respuesta.eval_count or 0,
+            segundos_generando=(respuesta.eval_duration or 0) / 1e9,
+            segundos_cargando_modelo=(respuesta.load_duration or 0) / 1e9,
         )
 
     @property
-    def total_de_entrada(self) -> int:
-        """Todo lo que el modelo 'leyó', venga o no de la caché."""
-        return self.leidos_de_cache + self.escritos_en_cache + self.sin_cache
+    def velocidad_de_lectura(self) -> float:
+        """Tokens 'leídos' por segundo. Con caché sale altísima: no leyó, recordó."""
+        return self.tokens_del_prompt / self.segundos_leyendo if self.segundos_leyendo else 0.0
 
     @property
-    def fraccion_desde_cache(self) -> float:
-        """Qué parte de la lectura se sirvió desde la caché (0.0 a 1.0)."""
-        if self.total_de_entrada == 0:
-            return 0.0
-        return self.leidos_de_cache / self.total_de_entrada
+    def velocidad_de_escritura(self) -> float:
+        """Tokens generados por segundo."""
+        return self.tokens_generados / self.segundos_generando if self.segundos_generando else 0.0
 
-    def costo_usd(self, modelo: str) -> float | None:
-        """Costo real de la llamada. None si no conocemos los precios del modelo."""
-        precios = PRECIOS_USD_POR_MILLON.get(modelo)
-        if precios is None:
-            return None
-        precio_escritura = precios[f"escritura_cache_{self.duracion_cache}"]
-        return (
-            self.sin_cache * precios["entrada"]
-            + self.escritos_en_cache * precio_escritura
-            + self.leidos_de_cache * precios["lectura_cache"]
-            + self.de_salida * precios["salida"]
-        ) / 1_000_000
+    @property
+    def modelo_recien_cargado(self) -> bool:
+        """
+        Si Ollama tuvo que cargar el modelo, la caché anterior se había perdido
+        (pasó el tiempo de `keep_alive` o se cambió algo que obliga a recargar).
+        """
+        return self.segundos_cargando_modelo > 0.5
 
-    def costo_sin_cache_usd(self, modelo: str) -> float | None:
-        """Lo que habría costado si TODO se hubiera leído en frío, sin caché."""
-        precios = PRECIOS_USD_POR_MILLON.get(modelo)
-        if precios is None:
+    def segundos_sin_cache(self, velocidad_en_frio: float) -> float | None:
+        """Estimación: cuánto habría tardado en leer TODO el prompt desde cero."""
+        if not velocidad_en_frio:
             return None
-        return (
-            self.total_de_entrada * precios["entrada"]
-            + self.de_salida * precios["salida"]
-        ) / 1_000_000
+        return self.tokens_del_prompt / velocidad_en_frio
 
 
 @dataclass
@@ -239,12 +215,15 @@ class InformeDeCarga:
 
     documentos: list[str]
     caracteres: int
-    tokens_de_conocimiento: int
-    fraccion_de_ventana: float  # qué parte de la ventana de contexto ocupa
-    es_cacheable: bool  # ¿supera el mínimo de tokens para caché?
-    precalentada: bool  # ¿logramos escribir la caché por adelantado?
-    recibo_precalentamiento: ReciboDeTokens | None
+    tokens_en_memoria: int  # tokens que ocupa el libro (más instrucciones) en la mesa
+    num_ctx: int  # tamaño de la mesa elegido
+    lectura_en_frio: MedicionDeTiempos  # la primera lectura, sin caché
     aviso: str | None = None
+
+    @property
+    def fraccion_de_mesa(self) -> float:
+        """Qué parte de la mesa ocupa el libro (0.0 a 1.0)."""
+        return self.tokens_en_memoria / self.num_ctx
 
 
 @dataclass
@@ -253,16 +232,63 @@ class RespuestaCAG:
 
     pregunta: str
     texto: str
-    recibo: ReciboDeTokens
-    modelo_que_respondio: str  # puede ser el de respaldo si hubo un rechazo
+    medicion: MedicionDeTiempos
+    modelo: str
     segundos_hasta_primer_token: float | None
     segundos_totales: float
-    razonamiento_resumido: str  # resumen del "pensamiento" interno del modelo
-    fue_rechazada: bool = False  # True si los filtros de seguridad la bloquearon
+    razonamiento: str  # lo que el modelo "pensó" antes de responder (si razona)
+    prompt_recortado: bool  # ⚠️ True si el libro no cupo completo en la mesa
+    cache_rota_a_proposito: bool = False
 
 
 class ConocimientoDemasiadoGrande(ValueError):
-    """Los documentos no caben en la memoria de trabajo del modelo."""
+    """Los documentos no caben en la mesa de estudio del modelo."""
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 🔎 CONOCER LOS MODELOS INSTALADOS
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def describir_modelo(cliente: ollama.Client, nombre: str) -> ModeloLocal:
+    """Pide a Ollama la ficha técnica de un modelo instalado."""
+    ficha = cliente.show(nombre)
+    arquitectura = (ficha.modelinfo or {}).get("general.architecture", "")
+    return ModeloLocal(
+        nombre=nombre,
+        familia=ficha.details.family or arquitectura,
+        tamano=ficha.details.parameter_size or "?",
+        cuantizacion=ficha.details.quantization_level or "?",
+        contexto_maximo=int((ficha.modelinfo or {}).get(f"{arquitectura}.context_length", 8192)),
+        soporta_razonamiento="thinking" in (ficha.capabilities or []),
+    )
+
+
+def listar_modelos_de_chat(cliente: ollama.Client) -> list[ModeloLocal]:
+    """
+    Todos los modelos instalados que saben conversar. Descartamos los de
+    "embeddings" (como nomic-embed-text), que convierten texto en números para
+    buscar (los usa RAG), pero no saben escribir respuestas.
+    """
+    modelos = []
+    for instalado in cliente.list().models:
+        if "completion" in (cliente.show(instalado.model).capabilities or []):
+            modelos.append(describir_modelo(cliente, instalado.model))
+    return sorted(modelos, key=lambda modelo: modelo.nombre)
+
+
+def nivel_de_razonamiento(modelo: ModeloLocal, razonar: bool) -> bool | str | None:
+    """
+    Traduce "¿quieres que piense antes de responder?" al valor que entiende
+    cada modelo. Pensar lo hace más lento pero más preciso (por ejemplo, en
+    cálculos como "días de vacaciones en el tercer año").
+    """
+    if not modelo.soporta_razonamiento:
+        return None  # este modelo no tiene modo de razonamiento
+    if modelo.familia == "gptoss":
+        # gpt-oss no permite apagarlo del todo: solo bajar de "medium" a "low".
+        return "medium" if razonar else "low"
+    return razonar
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -310,6 +336,15 @@ def construir_conocimiento_en_cache(documentos: list[Documento]) -> str:
     return "\n".join(partes)
 
 
+def calcular_tamano_de_mesa(caracteres: int) -> int:
+    """
+    Elige `num_ctx`: lo que (pesimistamente) ocupará el libro, más el margen
+    para conversar, redondeado hacia arriba a múltiplos de 4096 tokens.
+    """
+    tokens_estimados = caracteres / CARACTERES_POR_TOKEN_PESIMISTA
+    return max(8192, math.ceil((tokens_estimados + MARGEN_PARA_CONVERSACION) / 4096) * 4096)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 🧠 EL MOTOR CAG
 # ════════════════════════════════════════════════════════════════════════════
@@ -320,81 +355,87 @@ class MotorCAG:
     Guarda el conocimiento "memorizado" y responde preguntas sobre él.
 
     Uso mínimo:
-        motor = MotorCAG()
+        motor = MotorCAG("gpt-oss:20b")
         motor.cargar_conocimiento([Documento("manual.md", "...")])
         respuesta = motor.preguntar("¿Cuántos días de vacaciones tengo?")
         print(respuesta.texto)
     """
 
-    def __init__(self, api_key: str | None = None, cliente: anthropic.Anthropic | None = None):
-        # El "cliente" es el teléfono con el que llamamos a la API de Anthropic.
-        # Sin api_key explícita, lo busca solo en la variable ANTHROPIC_API_KEY.
-        if cliente is not None:
-            self.cliente = cliente
-        elif api_key:
-            self.cliente = anthropic.Anthropic(api_key=api_key)
-        else:
-            self.cliente = anthropic.Anthropic()
+    def __init__(
+        self,
+        modelo: str = MODELO_RECOMENDADO,
+        razonar: bool = True,
+        cliente: ollama.Client | None = None,
+    ):
+        # El "cliente" es el teléfono con el que hablamos con Ollama. Busca el
+        # servidor en http://localhost:11434 (o en la variable OLLAMA_HOST).
+        self.cliente = cliente or ollama.Client()
+        self.modelo = describir_modelo(self.cliente, modelo)
+        self.razonar = razonar
 
         self.conocimiento_en_cache: str = ""  # el "libro" que el modelo memoriza
         self.documentos_cargados: list[str] = []
-        self.duracion_cache: str = "5m"
+        self.duracion_cache: str = "10m"
+        self.num_ctx: int = 8192
         self.informe_de_carga: InformeDeCarga | None = None
 
     @property
     def tiene_conocimiento(self) -> bool:
         return bool(self.conocimiento_en_cache)
 
+    @property
+    def velocidad_de_lectura_en_frio(self) -> float:
+        """Tokens por segundo cuando el modelo lee SIN caché (medido al inyectar)."""
+        return self.informe_de_carga.lectura_en_frio.velocidad_de_lectura if self.informe_de_carga else 0.0
+
     # ── Piezas reutilizables de cada petición ───────────────────────────────
-
-    def marca_de_cache(self) -> dict:
-        """
-        La etiqueta `cache_control` que le dice al servidor: "guarda todo lo que
-        va desde el inicio de la petición hasta aquí".
-        """
-        marca = {"type": "ephemeral"}
-        if self.duracion_cache == "1h":
-            marca["ttl"] = "1h"
-        return marca
-
-    def bloque_de_conocimiento(self) -> dict:
-        """
-        El conocimiento listo para enviarse, con su marca de caché pegada.
-        Siempre es el PRIMER bloque de la petición (regla del prefijo).
-        """
-        return {
-            "type": "text",
-            "text": self.conocimiento_en_cache,
-            "cache_control": self.marca_de_cache(),
-        }
 
     def parametros_base(self) -> dict:
         """
         Parámetros idénticos en TODAS las llamadas (precalentamiento, chat y
         jueces). Mantenerlos iguales es lo que permite reutilizar la caché:
-        cambiar de modelo o de forma de razonar es como cambiar de estudiante,
-        y el nuevo no recuerda lo que memorizó el anterior.
+
+        • cambiar de modelo es cambiar de estudiante (el nuevo no recuerda nada);
+        • cambiar `num_ctx` obliga a Ollama a recargar el modelo (caché perdida);
+        • en algunos modelos, como gpt-oss, el nivel de razonamiento se escribe
+          al INICIO del prompt, así que cambiarlo también rompe el prefijo.
         """
         return {
-            "model": MODELO,
-            "thinking": PENSAMIENTO,
-            "betas": BETAS,
-            "fallbacks": RESPALDO_EN_SERVIDOR,
+            "model": self.modelo.nombre,
+            "think": nivel_de_razonamiento(self.modelo, self.razonar),
+            "keep_alive": self.duracion_cache,
+            "options": {"num_ctx": self.num_ctx, "temperature": TEMPERATURA},
         }
+
+    def prompt_de_sistema(self, instrucciones: str, romper_cache: bool = False) -> str:
+        """
+        Arma el mensaje de sistema: primero el conocimiento (prefijo estable),
+        después las instrucciones.
+
+        `romper_cache=True` es un EXPERIMENTO: pone la hora exacta al principio.
+        Como el inicio cambia en cada pregunta, el modelo ya no reconoce el
+        prefijo y tiene que releer todo el libro. Es el error más común en la
+        vida real: un "invalidador silencioso" (todo funciona, pero lento).
+        """
+        partes = [self.conocimiento_en_cache, instrucciones]
+        if romper_cache:
+            partes.insert(0, f"[Consulta realizada a las {datetime.now():%H:%M:%S.%f}]")
+        return "\n\n".join(partes)
 
     # ── Paso 1: inyectar el conocimiento ────────────────────────────────────
 
     def cargar_conocimiento(
-        self, documentos: list[Documento], duracion_cache: str = "5m"
+        self, documentos: list[Documento], duracion_cache: str = "10m"
     ) -> InformeDeCarga:
         """
         "Entrega el libro al estudiante antes del examen".
 
         1. Junta los documentos en `conocimiento_en_cache`.
-        2. Cuenta sus tokens (gratis) para saber si caben en la memoria.
-        3. Precalienta la caché: una llamada con `max_tokens=0` hace que el
-           servidor lea y guarde el conocimiento SIN generar respuesta. Así tu
-           primera pregunta real ya encuentra el libro memorizado.
+        2. Calcula el tamaño de la mesa (num_ctx) y comprueba que el libro cabe.
+        3. Borra la memoria del modelo (lo descarga) para medir una lectura
+           100 % en frío, sin apuntes previos.
+        4. Precalienta la caché: le pide leer el libro y escribir solo 1 token.
+           Así tu primera pregunta real ya encuentra el libro memorizado.
         """
         if not documentos:
             raise ValueError("No hay documentos que cargar.")
@@ -402,65 +443,50 @@ class MotorCAG:
             raise ValueError(f"Duración de caché no válida: {duracion_cache!r}")
 
         conocimiento = construir_conocimiento_en_cache(documentos)
-
-        # ¿Cabe en la mesa de estudio? count_tokens no genera texto ni cobra.
-        conteo = self.cliente.messages.count_tokens(
-            model=MODELO,
-            system=[{"type": "text", "text": conocimiento}],
-            messages=[{"role": "user", "content": "."}],
-        )
-        tokens_de_conocimiento = conteo.input_tokens
-        if tokens_de_conocimiento > LIMITE_SEGURO_DE_CONOCIMIENTO:
+        num_ctx = calcular_tamano_de_mesa(len(conocimiento))
+        limite = min(self.modelo.contexto_maximo, NUM_CTX_MAXIMO)
+        if num_ctx > limite:
             raise ConocimientoDemasiadoGrande(
-                f"Tus documentos ocupan ~{tokens_de_conocimiento:,} tokens y el límite "
-                f"seguro es {LIMITE_SEGURO_DE_CONOCIMIENTO:,}. Esta es justo la "
-                "limitación de CAG: todo el conocimiento debe caber en la memoria "
-                "del modelo. Para bibliotecas más grandes se usa RAG."
+                f"Tus documentos necesitan una mesa de ~{num_ctx:,} tokens y el límite "
+                f"para '{self.modelo.nombre}' en este equipo es {limite:,}. Esta es justo "
+                "la limitación de CAG: todo el conocimiento debe caber en la memoria del "
+                "modelo. Para bibliotecas más grandes se usa RAG."
             )
 
-        # Guardamos el "libro". A partir de aquí, cada pregunta lo incluye.
         self.conocimiento_en_cache = conocimiento
         self.documentos_cargados = sorted(documento.nombre for documento in documentos)
         self.duracion_cache = duracion_cache
+        self.num_ctx = num_ctx
 
-        es_cacheable = tokens_de_conocimiento >= MINIMO_TOKENS_PARA_CACHE
-        precalentada = False
-        recibo_precalentamiento = None
+        # 🧽 Mente en blanco: keep_alive=0 descarga el modelo y con él su caché.
+        self.cliente.generate(model=self.modelo.nombre, keep_alive=0)
+
+        # 📖 Primera lectura (en frío). Usamos EXACTAMENTE el mismo prompt de
+        # sistema que usará el chat, para que la caché quede lista.
+        parametros = self.parametros_base()
+        respuesta = self.cliente.chat(
+            **{**parametros, "options": {**parametros["options"], "num_predict": 1}},
+            messages=[
+                {"role": "system", "content": self.prompt_de_sistema(INSTRUCCIONES_MODO_ESTRICTO)},
+                # Texto de relleno: el modelo lo lee, pero solo escribe 1 token.
+                {"role": "user", "content": "."},
+            ],
+        )
+        lectura_en_frio = MedicionDeTiempos.desde_respuesta(respuesta)
+
         aviso = None
-
-        if not es_cacheable:
+        if lectura_en_frio.tokens_del_prompt > num_ctx - MARGEN_PARA_CONVERSACION:
             aviso = (
-                f"El conocimiento mide ~{tokens_de_conocimiento} tokens, menos del "
-                f"mínimo de {MINIMO_TOKENS_PARA_CACHE} que el servidor guarda en "
-                "caché. Funcionará igual, pero se leerá 'en frío' en cada pregunta."
+                "El libro ocupó más tokens de lo previsto y podría haberse recortado. "
+                "Prueba con menos documentos."
             )
-        else:
-            try:
-                mensaje = self.cliente.beta.messages.create(
-                    **self.parametros_base(),
-                    max_tokens=0,  # 👈 solo leer y memorizar, no responder
-                    output_config={"effort": ESFUERZO},
-                    system=[self.bloque_de_conocimiento()],
-                    # Texto de relleno: el modelo lo lee pero nunca lo contesta.
-                    messages=[{"role": "user", "content": "precalentamiento"}],
-                )
-                recibo_precalentamiento = ReciboDeTokens.desde_uso(mensaje.usage, duracion_cache)
-                precalentada = True
-            except anthropic.BadRequestError as error:
-                # No es grave: la primera pregunta real escribirá la caché.
-                aviso = (
-                    "No se pudo precalentar la caché "
-                    f"({error.message}). Se escribirá con tu primera pregunta."
-                )
 
         self.informe_de_carga = InformeDeCarga(
             documentos=self.documentos_cargados,
             caracteres=len(conocimiento),
-            tokens_de_conocimiento=tokens_de_conocimiento,
-            fraccion_de_ventana=tokens_de_conocimiento / VENTANA_DE_CONTEXTO_TOKENS,
-            es_cacheable=es_cacheable,
-            precalentada=precalentada,
-            recibo_precalentamiento=recibo_precalentamiento,
+            tokens_en_memoria=lectura_en_frio.tokens_del_prompt,
+            num_ctx=num_ctx,
+            lectura_en_frio=lectura_en_frio,
             aviso=aviso,
         )
         return self.informe_de_carga
@@ -472,15 +498,15 @@ class MotorCAG:
         pregunta: str,
         historial: list[dict] | None = None,
         permitir_conocimiento_externo: bool = False,
+        romper_cache: bool = False,
     ) -> "RespuestaEnVivo":
         """
         Prepara la petición y devuelve un objeto que entrega la respuesta
         pedacito a pedacito (streaming), como un grifo que abres y del que
         sale el agua poco a poco.
 
-        `historial` son los turnos anteriores de la conversación, en el
-        formato de la API: [{"role": "user", "content": "..."},
-        {"role": "assistant", "content": "..."}, ...]
+        `historial` son los turnos anteriores de la conversación:
+        [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}, ...]
         """
         if not self.tiene_conocimiento:
             raise RuntimeError("Primero carga conocimiento con cargar_conocimiento().")
@@ -490,27 +516,19 @@ class MotorCAG:
         )
         parametros_de_la_peticion = {
             **self.parametros_base(),
-            "max_tokens": MAX_TOKENS_RESPUESTA,
-            "output_config": {"effort": ESFUERZO},
-            # El orden importa: 1) conocimiento con marca de caché (idéntico
-            # siempre), 2) instrucciones (pueden cambiar sin romper la caché).
-            "system": [
-                self.bloque_de_conocimiento(),
-                {"type": "text", "text": instrucciones},
+            "messages": [
+                # 1) El mensaje de sistema empieza con el conocimiento (prefijo estable).
+                {"role": "system", "content": self.prompt_de_sistema(instrucciones, romper_cache)},
+                # 2) Al final, lo que cambia en cada turno: la conversación y la pregunta.
+                *(historial or []),
+                {"role": "user", "content": pregunta},
             ],
-            # Al final, lo que cambia en cada turno: la conversación y la pregunta.
-            "messages": [*(historial or []), {"role": "user", "content": pregunta}],
         }
-        return RespuestaEnVivo(self, parametros_de_la_peticion, pregunta)
+        return RespuestaEnVivo(self, parametros_de_la_peticion, pregunta, romper_cache)
 
-    def preguntar(
-        self,
-        pregunta: str,
-        historial: list[dict] | None = None,
-        permitir_conocimiento_externo: bool = False,
-    ) -> RespuestaCAG:
+    def preguntar(self, pregunta: str, historial: list[dict] | None = None, **opciones) -> RespuestaCAG:
         """Versión sin streaming: espera a que termine y devuelve la respuesta completa."""
-        respuesta_en_vivo = self.preguntar_en_vivo(pregunta, historial, permitir_conocimiento_externo)
+        respuesta_en_vivo = self.preguntar_en_vivo(pregunta, historial, **opciones)
         for _fragmento in respuesta_en_vivo:
             pass  # consumimos el grifo hasta el final
         return respuesta_en_vivo.resultado
@@ -520,48 +538,50 @@ class RespuestaEnVivo:
     """
     Un "grifo" de texto: al recorrerlo con `for`, entrega la respuesta a medida
     que el modelo la escribe. Cuando termina, `resultado` contiene la
-    RespuestaCAG completa con su recibo de tokens.
+    RespuestaCAG completa con sus tiempos.
     """
 
-    def __init__(self, motor: MotorCAG, parametros_de_la_peticion: dict, pregunta: str):
+    def __init__(self, motor: MotorCAG, parametros_de_la_peticion: dict, pregunta: str, romper_cache: bool):
         self._motor = motor
         self._parametros = parametros_de_la_peticion
         self._pregunta = pregunta
+        self._romper_cache = romper_cache
         self.resultado: RespuestaCAG | None = None
 
     def __iter__(self) -> Iterator[str]:
         inicio = time.perf_counter()
         segundos_hasta_primer_token = None
+        textos, pensamientos = [], []
+        ultimo_fragmento = None
 
-        with self._motor.cliente.beta.messages.stream(**self._parametros) as flujo:
-            for fragmento_de_texto in flujo.text_stream:
+        for fragmento in self._motor.cliente.chat(**self._parametros, stream=True):
+            # Los modelos que razonan primero "piensan" (no se muestra en el chat)
+            # y después escriben la respuesta.
+            if fragmento.message.thinking:
+                pensamientos.append(fragmento.message.thinking)
+            if fragmento.message.content:
                 if segundos_hasta_primer_token is None:
-                    # ⏱️ Latencia percibida: cuánto tardó en aparecer la primera
-                    # palabra. Con el conocimiento en caché, el modelo no tiene
-                    # que volver a "leer el libro" y empieza antes.
                     segundos_hasta_primer_token = time.perf_counter() - inicio
-                yield fragmento_de_texto
-            mensaje_final = flujo.get_final_message()
+                textos.append(fragmento.message.content)
+                yield fragmento.message.content
+            ultimo_fragmento = fragmento  # el último trae los tiempos medidos
 
-        # La respuesta llega en "bloques": de texto (lo que ves) y de
-        # pensamiento (el resumen de su razonamiento interno).
-        texto = "".join(bloque.text for bloque in mensaje_final.content if bloque.type == "text")
-        razonamiento = "\n\n".join(
-            bloque.thinking
-            for bloque in mensaje_final.content
-            if bloque.type == "thinking" and bloque.thinking
-        )
-
+        medicion = MedicionDeTiempos.desde_respuesta(ultimo_fragmento)
         self.resultado = RespuestaCAG(
             pregunta=self._pregunta,
-            texto=texto,
-            recibo=ReciboDeTokens.desde_uso(mensaje_final.usage, self._motor.duracion_cache),
-            modelo_que_respondio=mensaje_final.model,
+            texto="".join(textos),
+            medicion=medicion,
+            modelo=self._motor.modelo.nombre,
             segundos_hasta_primer_token=segundos_hasta_primer_token,
             segundos_totales=time.perf_counter() - inicio,
-            razonamiento_resumido=razonamiento,
-            # "refusal" = incluso el modelo de respaldo rechazó la petición.
-            fue_rechazada=mensaje_final.stop_reason == "refusal",
+            razonamiento="".join(pensamientos),
+            # 🚨 El prompt siempre incluye el libro completo, así que si Ollama
+            # dice que leyó MENOS tokens que el libro, lo recortó en silencio.
+            # (Damos un pequeño margen porque las instrucciones del modo libre
+            # son más cortas que las del modo estricto.)
+            prompt_recortado=medicion.tokens_del_prompt
+            < self._motor.informe_de_carga.tokens_en_memoria - TOLERANCIA_DE_TOKENS,
+            cache_rota_a_proposito=self._romper_cache,
         )
 
 
@@ -572,28 +592,15 @@ class RespuestaEnVivo:
 
 def explicar_error(error: Exception) -> str:
     """Traduce los errores técnicos más comunes a un mensaje comprensible."""
-    # Vamos de lo más específico a lo más general.
-    if isinstance(error, anthropic.AuthenticationError):
-        return "🔑 La API key no es válida. Revísala en la barra lateral o en ANTHROPIC_API_KEY."
-    if isinstance(error, anthropic.PermissionDeniedError):
-        return "🚫 Tu API key no tiene permiso para usar este modelo o función."
-    if isinstance(error, anthropic.NotFoundError):
-        return f"🔎 No se encontró el modelo '{MODELO}'. Revisa la variable CAG_MODELO."
-    if isinstance(error, anthropic.RateLimitError):
-        return "⏳ Demasiadas peticiones seguidas. Espera un minuto y vuelve a intentarlo."
-    if isinstance(error, anthropic.BadRequestError):
-        return f"📝 La API rechazó la petición: {error.message}"
-    if isinstance(error, anthropic.APIStatusError):
-        if error.status_code >= 500:
-            return "🛠️ El servidor de Anthropic tuvo un problema temporal. Intenta de nuevo."
-        return f"⚠️ Error de la API ({error.status_code}): {error.message}"
-    if isinstance(error, anthropic.APIConnectionError):
-        return "🌐 No hay conexión con la API de Anthropic. Revisa tu internet."
-    if "authentication" in str(error).lower() or "api_key" in str(error).lower():
+    if isinstance(error, ConnectionError):
         return (
-            "🔑 No encontré credenciales. Escribe tu API key en la barra lateral o "
-            "define la variable de entorno ANTHROPIC_API_KEY."
+            "🔌 No encuentro Ollama. ¿Está encendido? Ábrelo o ejecuta `ollama serve` "
+            "en una terminal. Si no lo tienes, descárgalo gratis en https://ollama.com/download"
         )
+    if isinstance(error, ollama.ResponseError):
+        if error.status_code == 404:
+            return f"📦 Ese modelo no está instalado. Descárgalo con: `ollama pull {MODELO_RECOMENDADO}`"
+        return f"⚠️ Ollama respondió con un error ({error.status_code}): {error.error}"
     return f"❌ Error inesperado: {error}"
 
 
@@ -605,13 +612,11 @@ if __name__ == "__main__":
     ruta_ejemplo = Path(__file__).parent / "datos" / "manual_cooperativa_nube_alta.md"
     motor = MotorCAG()
 
-    print("📚 Inyectando el documento de ejemplo en la caché…")
+    print(f"📚 Inyectando el documento de ejemplo en la caché de {motor.modelo.nombre}…")
     informe = motor.cargar_conocimiento([Documento(ruta_ejemplo.name, ruta_ejemplo.read_text("utf-8"))])
-    print(f"   Tokens memorizados: {informe.tokens_de_conocimiento:,}")
-    if informe.recibo_precalentamiento:
-        print(f"   Escritos en caché (precalentamiento): {informe.recibo_precalentamiento.escritos_en_cache:,}")
-    if informe.aviso:
-        print(f"   Aviso: {informe.aviso}")
+    frio = informe.lectura_en_frio
+    print(f"   Mesa (num_ctx): {informe.num_ctx:,} tokens | libro: {informe.tokens_en_memoria:,} tokens")
+    print(f"   Lectura en frío: {frio.segundos_leyendo:.2f} s ({frio.velocidad_de_lectura:,.0f} tokens/s)")
 
     for pregunta in [
         "¿Cuántas horas fermenta el café y hasta qué humedad se seca?",
@@ -621,9 +626,9 @@ if __name__ == "__main__":
         respuesta_en_vivo = motor.preguntar_en_vivo(pregunta)
         for fragmento in respuesta_en_vivo:
             print(fragmento, end="", flush=True)
-        recibo = respuesta_en_vivo.resultado.recibo
+        medicion = respuesta_en_vivo.resultado.medicion
+        sin_cache = medicion.segundos_sin_cache(motor.velocidad_de_lectura_en_frio)
         print(
-            f"\n   🧾 Leídos de caché: {recibo.leidos_de_cache:,} | "
-            f"Escritos en caché: {recibo.escritos_en_cache:,} | "
-            f"Sin caché: {recibo.sin_cache:,} | Salida: {recibo.de_salida:,}"
+            f"\n   ⏱️ Leyó {medicion.tokens_del_prompt:,} tokens en {medicion.segundos_leyendo:.2f} s "
+            f"(sin caché: ~{sin_cache:.2f} s)"
         )
