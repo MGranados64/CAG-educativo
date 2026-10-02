@@ -20,13 +20,23 @@ Tenemos DOS jueces, cada uno con una sola pregunta en mente
   🎯 Juez de RELEVANCIA (Answer Relevancy)
      "¿Contestó lo que se le preguntó, o se fue por las ramas?"
 
+Y dos jueces más para el banco de pruebas CAG vs RAG (comparacion.py), que
+usan preguntas cuya respuesta correcta ya conocemos:
+
+  ✅ Juez de EXACTITUD (Answer Correctness)
+     "¿Coincide con la respuesta de referencia?"
+
+  🔎 Juez de RECUPERACIÓN (Context Recall), solo para RAG
+     "¿El buscador trajo los fragmentos necesarios para responder?"
+
 📐 INSPIRACIÓN: LAS MÉTRICAS DE RAGAS (Es et al., EACL 2024)
 -----------------------------------------------------------
   • Faithfulness: se divide la respuesta en afirmaciones atómicas (frases con
     un solo hecho) y se verifica cada una contra el contexto.
         puntaje = afirmaciones respaldadas / afirmaciones totales
     Aquí hacemos exactamente eso, y además pedimos al juez la CITA TEXTUAL
-    del documento que respalda cada afirmación (transparencia total).
+    del documento que respalda cada afirmación, y Python comprueba que esa
+    cita exista de verdad (ver cita_verificada).
 
   • Answer Relevancy: RAGas genera preguntas a partir de la respuesta
     ("preguntas inversas") y mide con embeddings qué tan parecidas son a la
@@ -54,9 +64,9 @@ Pruébalo desde la terminal (con Ollama encendido):
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from cag_core import MedicionDeTiempos, MotorCAG
 
@@ -75,17 +85,20 @@ documentos, NO está respaldado.
 Recibirás una pregunta y la respuesta que dio un asistente. Haz lo siguiente:
 1. Divide la respuesta en afirmaciones atómicas: frases cortas que afirman un \
 solo hecho verificable. Usa SOLO lo que dice la respuesta; no agregues \
-afirmaciones que no estén en ella. Ignora saludos y cortesías. Si la respuesta \
-dice que algo NO aparece en los documentos, esa también es una afirmación: está \
-respaldada si efectivamente no aparece.
-2. Para cada afirmación, busca en los documentos la cita textual que la \
-respalda (copia el fragmento exacto, máximo dos frases). Si no existe, deja la \
-evidencia vacía.
-3. Explica en una frase tu razonamiento y después da el veredicto: \
-respaldada = true solo si la evidencia la confirma por completo (se permiten \
-cálculos sencillos con datos del documento, como sumar días). Si contradice el \
-documento o agrega datos que no están, respaldada = false.
-4. Escribe un resumen de una o dos frases que entienda una persona sin \
+afirmaciones que no estén en ella. Ignora saludos, cortesías y las menciones de \
+la fuente (como "según la sección 4 del manual").
+2. Clasifica cada afirmación: tipo = "ausencia" si dice que algo NO aparece en \
+los documentos (está respaldada si efectivamente no aparece); tipo = "hecho" en \
+cualquier otro caso.
+3. Para cada hecho, copia de los documentos la cita textual que lo respalda: el \
+fragmento exacto (máximo dos frases) que contiene el dato concreto (la cifra, el \
+nombre o el suceso). Nunca copies etiquetas como <documento>. Si no existe, deja \
+la evidencia vacía.
+4. Explica en una frase tu razonamiento y después da el veredicto: \
+respaldada = true solo si la evidencia confirma el hecho por completo (se \
+permiten cálculos sencillos con datos del documento, como sumar días). Si tu \
+razonamiento dice que el documento no menciona el dato, respaldada = false.
+5. Escribe un resumen de una o dos frases que entienda una persona sin \
 conocimientos técnicos.
 Responde en español."""
 
@@ -102,11 +115,12 @@ ESQUEMA_VERACIDAD = {
                 "type": "object",
                 "properties": {
                     "afirmacion": {"type": "string"},
+                    "tipo": {"type": "string", "enum": ["hecho", "ausencia"]},
                     "evidencia": {"type": "string"},
                     "razonamiento": {"type": "string"},
                     "respaldada": {"type": "boolean"},
                 },
-                "required": ["afirmacion", "evidencia", "razonamiento", "respaldada"],
+                "required": ["afirmacion", "tipo", "evidencia", "razonamiento", "respaldada"],
             },
         },
         "resumen": {"type": "string"},
@@ -153,6 +167,68 @@ ESQUEMA_RELEVANCIA = {
 }
 
 # ════════════════════════════════════════════════════════════════════════════
+# ✅ JUEZ DE EXACTITUD (para el banco de pruebas "cara a cara")
+# ════════════════════════════════════════════════════════════════════════════
+
+# Cuando SÍ conocemos la respuesta correcta (las preguntas de referencia de
+# datos/*/preguntas.json), podemos ir más allá de la veracidad: ¿acertó?
+# Equivale a la métrica "answer correctness" de RAGas.
+INSTRUCCIONES_JUEZ_EXACTITUD = """\
+Eres un profesor que compara la respuesta de un asistente con la respuesta \
+correcta (la "respuesta de referencia").
+
+Reglas:
+- Compara el SIGNIFICADO, no las palabras exactas ni el idioma.
+- Las cifras, fechas y nombres deben coincidir con la referencia.
+- "correcta": contiene todo lo esencial de la referencia y no la contradice.
+- "parcial": acierta solo una parte o le falta algo importante.
+- "incorrecta": contradice la referencia, no contesta o inventa la respuesta.
+- La información ADICIONAL que no contradice la referencia NO es un error: no \
+la penalices (si es inventada, de eso se encarga otro auditor, el de veracidad).
+- Si la referencia dice que la información no aparece en los documentos, la \
+respuesta es correcta solo si también dice que no tiene esa información; si \
+inventa un dato, es incorrecta.
+Explica brevemente tu razonamiento antes del veredicto. Responde en español."""
+
+ESQUEMA_EXACTITUD = {
+    "type": "object",
+    "properties": {
+        "razonamiento": {"type": "string"},
+        "veredicto": {"type": "string", "enum": ["correcta", "parcial", "incorrecta"]},
+    },
+    "required": ["razonamiento", "veredicto"],
+}
+PUNTAJE_DE_EXACTITUD = {"correcta": 1.0, "parcial": 0.5, "incorrecta": 0.0}
+
+# ════════════════════════════════════════════════════════════════════════════
+# 🔎 JUEZ DE RECUPERACIÓN (solo para RAG)
+# ════════════════════════════════════════════════════════════════════════════
+
+# RAG puede fallar por dos motivos muy distintos: el BUSCADOR no trajo el
+# fragmento correcto, o el MODELO lo tenía y aun así respondió mal. Este juez
+# separa ambos casos. Equivale a la métrica "context recall" de RAGas.
+INSTRUCCIONES_JUEZ_RECUPERACION = """\
+Eres un auditor del buscador de un sistema RAG. Recibirás una pregunta, su \
+respuesta correcta y los fragmentos de texto que el buscador recuperó.
+
+Decide si esos fragmentos contienen la información necesaria para llegar a la \
+respuesta correcta:
+- "completa": con esos fragmentos se puede responder todo.
+- "parcial": contienen solo una parte de la información necesaria.
+- "nada": no contienen la información necesaria.
+Explica qué dato falta, si falta alguno, antes del veredicto. Responde en español."""
+
+ESQUEMA_RECUPERACION = {
+    "type": "object",
+    "properties": {
+        "razonamiento": {"type": "string"},
+        "veredicto": {"type": "string", "enum": ["completa", "parcial", "nada"]},
+    },
+    "required": ["razonamiento", "veredicto"],
+}
+PUNTAJE_DE_RECUPERACION = {"completa": 1.0, "parcial": 0.5, "nada": 0.0}
+
+# ════════════════════════════════════════════════════════════════════════════
 # 📦 RESULTADOS
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -182,6 +258,16 @@ class ResultadoRelevancia:
 
 
 @dataclass
+class ResultadoConVeredicto:
+    """Resultado de los jueces de exactitud y de recuperación."""
+
+    puntaje: float  # 1.0, 0.5 o 0.0
+    veredicto: str = ""
+    razonamiento: str = ""
+    error: str | None = None
+
+
+@dataclass
 class InformeDeEvaluacion:
     veracidad: ResultadoVeracidad
     relevancia: ResultadoRelevancia
@@ -206,11 +292,9 @@ class JuezSinVeredicto(RuntimeError):
     """El juez no devolvió una evaluación utilizable."""
 
 
-def _llamar_al_juez(
-    motor: MotorCAG, system: str, pregunta: str, respuesta: str, esquema: dict
-) -> tuple[dict, MedicionDeTiempos]:
+def _llamar_al_juez(motor: MotorCAG, system: str, contenido: str, esquema: dict) -> tuple[dict, MedicionDeTiempos]:
     """
-    Envía la pregunta y la respuesta a auditar, y exige que el juez conteste
+    Envía al juez el material a revisar (`contenido`) y exige que conteste
     rellenando el `esquema` JSON. Devuelve los datos ya convertidos a un
     diccionario de Python, junto con sus tiempos.
     """
@@ -219,13 +303,7 @@ def _llamar_al_juez(
         format=esquema,  # 👈 "salida estructurada": el JSON DEBE encajar en el molde
         messages=[
             {"role": "system", "content": system},
-            {
-                "role": "user",
-                "content": (
-                    f"<pregunta>\n{pregunta}\n</pregunta>\n\n"
-                    f"<respuesta_a_auditar>\n{respuesta}\n</respuesta_a_auditar>"
-                ),
-            },
+            {"role": "user", "content": contenido},
         ],
     )
     if resultado.done_reason == "length":
@@ -241,16 +319,93 @@ def _llamar_al_juez(
     return datos, MedicionDeTiempos.desde_respuesta(resultado)
 
 
+def _pregunta_y_respuesta(pregunta: str, respuesta: str) -> str:
+    """El material que reciben los jueces de veracidad y relevancia."""
+    return (
+        f"<pregunta>\n{pregunta}\n</pregunta>\n\n"
+        f"<respuesta_a_auditar>\n{respuesta}\n</respuesta_a_auditar>"
+    )
+
+
+# Para comprobar las citas: qué fracción de los pares de palabras de la cita
+# debe existir en los documentos, y palabras demasiado comunes para decir si
+# una cita "tiene que ver" con una afirmación.
+COINCIDENCIA_MINIMA_DE_LA_CITA = 0.7
+PALABRAS_COMUNES = {
+    "sobre", "entre", "desde", "hasta", "según", "donde", "cuando", "tiene", "tienen",
+    "puede", "pueden", "debe", "deben", "están", "estos", "estas", "otros", "otras",
+    "cada", "todos", "todas", "documento", "documentos", "información", "respuesta",
+    "about", "which", "there", "their", "these", "those", "where", "would", "could",
+}
+
+
+def _palabras(texto: str) -> list[str]:
+    """Las palabras y cifras de un texto, en minúsculas y sin formato ni puntuación."""
+    return re.findall(r"[^\W_]+", texto.lower())
+
+
+def cita_verificada(evidencia: str, conocimiento: str, afirmacion: str = "") -> bool:
+    """
+    🔍 No le creemos al juez sin pruebas: Python comprueba su cita.
+
+    Los modelos rara vez copian letra por letra: unen renglones de una lista o
+    de una tabla, quitan negritas, cambian comillas... Por eso no exigimos una
+    copia exacta, sino tres cosas que una cita inventada no cumple:
+
+      1. EXISTE: al menos el 70 % de sus pares de palabras seguidas aparecen
+         en los documentos ("fermentación de 72 horas" no aparece).
+      2. SUS CIFRAS EXISTEN: todos sus números están en los documentos.
+      3. TIENE QUE VER: comparte al menos una palabra importante (o una cifra)
+         con la afirmación. Copiar un texto real que no habla del tema no vale.
+
+    Tampoco vale copiar etiquetas (<documento ...>) en lugar de contenido.
+    """
+    if not evidencia.strip() or "<" in evidencia:
+        return False
+    palabras_cita = _palabras(evidencia)
+    palabras_documentos = _palabras(conocimiento)
+    if len(palabras_cita) < 2:
+        return False
+
+    pares_documentos = set(zip(palabras_documentos, palabras_documentos[1:]))
+    pares_cita = list(zip(palabras_cita, palabras_cita[1:]))
+    coincidencia = sum(par in pares_documentos for par in pares_cita) / len(pares_cita)
+    if coincidencia < COINCIDENCIA_MINIMA_DE_LA_CITA:
+        return False
+
+    cifras_documentos = {palabra for palabra in palabras_documentos if palabra.isdigit()}
+    if any(palabra.isdigit() and palabra not in cifras_documentos for palabra in palabras_cita):
+        return False
+
+    importantes = {
+        palabra
+        for palabra in _palabras(afirmacion)
+        if palabra.isdigit() or (len(palabra) >= 5 and palabra not in PALABRAS_COMUNES)
+    }
+    return not importantes or bool(importantes & set(palabras_cita))
+
+
 def evaluar_veracidad(motor: MotorCAG, pregunta: str, respuesta: str) -> ResultadoVeracidad:
     """⚖️ ¿Cada afirmación de la respuesta está respaldada por el documento?"""
     # El conocimiento va primero (vía prompt_de_sistema) para reutilizar la caché.
     system = motor.prompt_de_sistema(INSTRUCCIONES_JUEZ_VERACIDAD)
     try:
-        datos, medicion = _llamar_al_juez(motor, system, pregunta, respuesta, ESQUEMA_VERACIDAD)
+        datos, medicion = _llamar_al_juez(
+            motor, system, _pregunta_y_respuesta(pregunta, respuesta), ESQUEMA_VERACIDAD
+        )
     except JuezSinVeredicto as error:
         return ResultadoVeracidad(puntaje=0.0, error=str(error))
 
     afirmaciones = datos["afirmaciones"]
+    for afirmacion in afirmaciones:
+        # Un HECHO solo cuenta como respaldado si su cita existe de verdad. (Las
+        # afirmaciones de AUSENCIA, "no aparece en los documentos", no llevan cita.)
+        if afirmacion["tipo"] == "hecho" and afirmacion["respaldada"]:
+            if not cita_verificada(afirmacion["evidencia"], motor.conocimiento_en_cache, afirmacion["afirmacion"]):
+                afirmacion["respaldada"] = False
+                afirmacion["razonamiento"] += (
+                    " ⚠️ Python no encontró esa cita textual en los documentos, así que no cuenta como respaldo."
+                )
     if afirmaciones:
         # 🧮 La fórmula de RAGas, calculada por Python (no por el modelo), para
         # que el número sea exacto y reproducible.
@@ -269,7 +424,7 @@ def evaluar_relevancia(motor: MotorCAG, pregunta: str, respuesta: str) -> Result
     """🎯 ¿La respuesta contesta directamente lo que se preguntó?"""
     try:
         datos, medicion = _llamar_al_juez(
-            motor, INSTRUCCIONES_JUEZ_RELEVANCIA, pregunta, respuesta, ESQUEMA_RELEVANCIA
+            motor, INSTRUCCIONES_JUEZ_RELEVANCIA, _pregunta_y_respuesta(pregunta, respuesta), ESQUEMA_RELEVANCIA
         )
     except JuezSinVeredicto as error:
         return ResultadoRelevancia(puntaje=0.0, error=str(error))
@@ -295,6 +450,49 @@ def evaluar_respuesta(motor: MotorCAG, pregunta: str, respuesta: str) -> Informe
     veracidad = evaluar_veracidad(motor, pregunta, respuesta)
     relevancia = evaluar_relevancia(motor, pregunta, respuesta)
     return InformeDeEvaluacion(veracidad, relevancia, segundos=time.perf_counter() - inicio)
+
+
+def evaluar_exactitud(
+    motor: MotorCAG, pregunta: str, respuesta: str, respuesta_esperada: str
+) -> ResultadoConVeredicto:
+    """✅ ¿La respuesta coincide con la respuesta de referencia?"""
+    contenido = (
+        f"<pregunta>\n{pregunta}\n</pregunta>\n\n"
+        f"<respuesta_de_referencia>\n{respuesta_esperada}\n</respuesta_de_referencia>\n\n"
+        f"<respuesta_a_calificar>\n{respuesta}\n</respuesta_a_calificar>"
+    )
+    try:
+        datos, _ = _llamar_al_juez(motor, INSTRUCCIONES_JUEZ_EXACTITUD, contenido, ESQUEMA_EXACTITUD)
+    except JuezSinVeredicto as error:
+        return ResultadoConVeredicto(puntaje=0.0, error=str(error))
+    return ResultadoConVeredicto(
+        puntaje=PUNTAJE_DE_EXACTITUD[datos["veredicto"]],
+        veredicto=datos["veredicto"],
+        razonamiento=datos["razonamiento"],
+    )
+
+
+def evaluar_recuperacion(
+    motor: MotorCAG, pregunta: str, respuesta_esperada: str, fragmentos: list[str]
+) -> ResultadoConVeredicto:
+    """🔎 ¿El buscador de RAG trajo los fragmentos necesarios para responder?"""
+    fragmentos_numerados = "\n\n".join(
+        f'<fragmento numero="{numero}">\n{texto}\n</fragmento>' for numero, texto in enumerate(fragmentos, start=1)
+    )
+    contenido = (
+        f"<pregunta>\n{pregunta}\n</pregunta>\n\n"
+        f"<respuesta_correcta>\n{respuesta_esperada}\n</respuesta_correcta>\n\n"
+        f"<fragmentos_recuperados>\n{fragmentos_numerados}\n</fragmentos_recuperados>"
+    )
+    try:
+        datos, _ = _llamar_al_juez(motor, INSTRUCCIONES_JUEZ_RECUPERACION, contenido, ESQUEMA_RECUPERACION)
+    except JuezSinVeredicto as error:
+        return ResultadoConVeredicto(puntaje=0.0, error=str(error))
+    return ResultadoConVeredicto(
+        puntaje=PUNTAJE_DE_RECUPERACION[datos["veredicto"]],
+        veredicto=datos["veredicto"],
+        razonamiento=datos["razonamiento"],
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -330,11 +528,10 @@ CASOS_DE_PRUEBA = [
 ]
 
 if __name__ == "__main__":
-    from cag_core import Documento
+    from cag_core import CARPETA_CORPUS_DE_EJEMPLO, cargar_documentos_de_carpeta
 
-    ruta_ejemplo = Path(__file__).parent / "datos" / "manual_cooperativa_nube_alta.md"
     motor = MotorCAG()
-    motor.cargar_conocimiento([Documento(ruta_ejemplo.name, ruta_ejemplo.read_text("utf-8"))])
+    motor.cargar_conocimiento(cargar_documentos_de_carpeta(CARPETA_CORPUS_DE_EJEMPLO))
 
     for caso in CASOS_DE_PRUEBA:
         informe = evaluar_respuesta(motor, caso["pregunta"], caso["respuesta"])

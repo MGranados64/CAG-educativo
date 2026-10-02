@@ -30,7 +30,7 @@ libro, el modelo NO lo vuelve a leer: consulta sus apuntes.
      estudio" (num_ctx) y precalienta la caché leyendo el libro una vez.
   2. MotorCAG.preguntar_en_vivo()  → envía [conocimiento + instrucciones +
      pregunta] y devuelve la respuesta palabra por palabra (streaming).
-  3. RespuestaCAG                   → la respuesta final más sus "tiempos":
+  3. RespuestaDelModelo             → la respuesta final más sus "tiempos":
      cuánto tardó en leer el prompt y cuánto habría tardado sin caché.
 
 📏 LA REGLA DE ORO DE LA CACHÉ: EL PREFIJO
@@ -97,6 +97,9 @@ DURACIONES_DE_CACHE = {"10m": "10 minutos", "1h": "1 hora"}
 
 # Margen al comparar tamaños de prompt para detectar recortes (ver RespuestaEnVivo).
 TOLERANCIA_DE_TOKENS = 256
+
+# Los documentos de ejemplo: cuatro textos ficticios de una cooperativa cafetalera.
+CARPETA_CORPUS_DE_EJEMPLO = Path(__file__).parent / "datos" / "cooperativa"
 
 # Para la proyección educativa: "¿cuánto tardaría en releer un libro grande?"
 TOKENS_DE_UN_LIBRO_GRANDE = 100_000
@@ -227,8 +230,11 @@ class InformeDeCarga:
 
 
 @dataclass
-class RespuestaCAG:
-    """Una respuesta del modelo con toda la información para auditarla."""
+class RespuestaDelModelo:
+    """
+    Una respuesta del modelo con toda la información para auditarla.
+    La usan los dos sistemas: CAG (cag_core.py) y RAG (rag_core.py).
+    """
 
     pregunta: str
     texto: str
@@ -239,6 +245,9 @@ class RespuestaCAG:
     razonamiento: str  # lo que el modelo "pensó" antes de responder (si razona)
     prompt_recortado: bool  # ⚠️ True si el libro no cupo completo en la mesa
     cache_rota_a_proposito: bool = False
+    # Solo en RAG: los fragmentos que trajo el buscador y cuánto tardó en buscarlos.
+    fragmentos_recuperados: list | None = None
+    segundos_buscando: float = 0.0
 
 
 class ConocimientoDemasiadoGrande(ValueError):
@@ -313,6 +322,19 @@ def extraer_texto(nombre_archivo: str, contenido: bytes) -> str:
         ]
         return "\n\n".join(paginas)
     return contenido.decode("utf-8", errors="replace")
+
+
+def cargar_documentos_de_carpeta(carpeta: Path) -> list[Documento]:
+    """
+    Lee todos los documentos (.md, .txt, .pdf) de una carpeta. Los archivos que
+    empiezan con "_" (notas, licencias) y los .json (preguntas de prueba) no son
+    conocimiento, así que se ignoran.
+    """
+    documentos = []
+    for ruta in sorted(Path(carpeta).iterdir()):
+        if ruta.suffix.lower() in {".md", ".txt", ".pdf"} and not ruta.name.startswith("_"):
+            documentos.append(Documento(ruta.name, extraer_texto(ruta.name, ruta.read_bytes())))
+    return documentos
 
 
 def construir_conocimiento_en_cache(documentos: list[Documento]) -> str:
@@ -524,9 +546,18 @@ class MotorCAG:
                 {"role": "user", "content": pregunta},
             ],
         }
-        return RespuestaEnVivo(self, parametros_de_la_peticion, pregunta, romper_cache)
+        return RespuestaEnVivo(
+            self.cliente,
+            parametros_de_la_peticion,
+            pregunta,
+            # El prompt siempre incluye el libro completo: si Ollama dice que leyó
+            # menos tokens que el libro, lo recortó en silencio. (Damos un margen
+            # porque las instrucciones del modo libre son más cortas.)
+            tokens_minimos_esperados=self.informe_de_carga.tokens_en_memoria - TOLERANCIA_DE_TOKENS,
+            romper_cache=romper_cache,
+        )
 
-    def preguntar(self, pregunta: str, historial: list[dict] | None = None, **opciones) -> RespuestaCAG:
+    def preguntar(self, pregunta: str, historial: list[dict] | None = None, **opciones) -> RespuestaDelModelo:
         """Versión sin streaming: espera a que termine y devuelve la respuesta completa."""
         respuesta_en_vivo = self.preguntar_en_vivo(pregunta, historial, **opciones)
         for _fragmento in respuesta_en_vivo:
@@ -538,15 +569,23 @@ class RespuestaEnVivo:
     """
     Un "grifo" de texto: al recorrerlo con `for`, entrega la respuesta a medida
     que el modelo la escribe. Cuando termina, `resultado` contiene la
-    RespuestaCAG completa con sus tiempos.
+    RespuestaDelModelo completa con sus tiempos. Lo usan CAG y RAG.
     """
 
-    def __init__(self, motor: MotorCAG, parametros_de_la_peticion: dict, pregunta: str, romper_cache: bool):
-        self._motor = motor
+    def __init__(
+        self,
+        cliente: ollama.Client,
+        parametros_de_la_peticion: dict,
+        pregunta: str,
+        tokens_minimos_esperados: int = 0,
+        romper_cache: bool = False,
+    ):
+        self._cliente = cliente
         self._parametros = parametros_de_la_peticion
         self._pregunta = pregunta
+        self._tokens_minimos_esperados = tokens_minimos_esperados
         self._romper_cache = romper_cache
-        self.resultado: RespuestaCAG | None = None
+        self.resultado: RespuestaDelModelo | None = None
 
     def __iter__(self) -> Iterator[str]:
         inicio = time.perf_counter()
@@ -554,7 +593,7 @@ class RespuestaEnVivo:
         textos, pensamientos = [], []
         ultimo_fragmento = None
 
-        for fragmento in self._motor.cliente.chat(**self._parametros, stream=True):
+        for fragmento in self._cliente.chat(**self._parametros, stream=True):
             # Los modelos que razonan primero "piensan" (no se muestra en el chat)
             # y después escriben la respuesta.
             if fragmento.message.thinking:
@@ -567,20 +606,17 @@ class RespuestaEnVivo:
             ultimo_fragmento = fragmento  # el último trae los tiempos medidos
 
         medicion = MedicionDeTiempos.desde_respuesta(ultimo_fragmento)
-        self.resultado = RespuestaCAG(
+        self.resultado = RespuestaDelModelo(
             pregunta=self._pregunta,
             texto="".join(textos),
             medicion=medicion,
-            modelo=self._motor.modelo.nombre,
+            modelo=self._parametros["model"],
             segundos_hasta_primer_token=segundos_hasta_primer_token,
             segundos_totales=time.perf_counter() - inicio,
             razonamiento="".join(pensamientos),
-            # 🚨 El prompt siempre incluye el libro completo, así que si Ollama
-            # dice que leyó MENOS tokens que el libro, lo recortó en silencio.
-            # (Damos un pequeño margen porque las instrucciones del modo libre
-            # son más cortas que las del modo estricto.)
-            prompt_recortado=medicion.tokens_del_prompt
-            < self._motor.informe_de_carga.tokens_en_memoria - TOLERANCIA_DE_TOKENS,
+            # 🚨 Si Ollama leyó menos tokens de los que sabemos que tiene el
+            # prompt, es que lo recortó en silencio.
+            prompt_recortado=medicion.tokens_del_prompt < self._tokens_minimos_esperados,
             cache_rota_a_proposito=self._romper_cache,
         )
 
@@ -609,11 +645,10 @@ def explicar_error(error: Exception) -> str:
 # ════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    ruta_ejemplo = Path(__file__).parent / "datos" / "manual_cooperativa_nube_alta.md"
     motor = MotorCAG()
 
-    print(f"📚 Inyectando el documento de ejemplo en la caché de {motor.modelo.nombre}…")
-    informe = motor.cargar_conocimiento([Documento(ruta_ejemplo.name, ruta_ejemplo.read_text("utf-8"))])
+    print(f"📚 Inyectando el corpus de ejemplo en la caché de {motor.modelo.nombre}…")
+    informe = motor.cargar_conocimiento(cargar_documentos_de_carpeta(CARPETA_CORPUS_DE_EJEMPLO))
     frio = informe.lectura_en_frio
     print(f"   Mesa (num_ctx): {informe.num_ctx:,} tokens | libro: {informe.tokens_en_memoria:,} tokens")
     print(f"   Lectura en frío: {frio.segundos_leyendo:.2f} s ({frio.velocidad_de_lectura:,.0f} tokens/s)")
