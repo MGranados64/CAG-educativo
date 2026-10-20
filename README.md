@@ -80,28 +80,41 @@ mismos jueces. La única diferencia es qué texto ve el modelo: **todo** (CAG) o
 - **🏁 Banco de pruebas:** todas las preguntas de referencia (con su respuesta correcta),
   calificadas con tres jueces: ✅ **exactitud**, ⚖️ **veracidad** y 🔎 **recuperación**
   (¿el buscador de RAG trajo lo necesario?). Exporta todo a **JSON**.
+- **🏆 Liga de estrategias:** CAG contra las cuatro formas de buscar de RAG a la vez.
+
+**Cuatro estrategias de RAG**, todas sobre el mismo fichero (se cambian sin volver a indexar):
+
+| Estrategia | Cómo busca |
+|---|---|
+| 🔎 **Clásico** | Por significado (embeddings): las *k* fichas más parecidas. |
+| 🔀 **Híbrido** | Por significado **y** por palabras exactas (BM25), une las listas (RRF) y el modelo elige las mejores (*reranking*). |
+| 👪 **Padre-hijo** | Busca fichas pequeñas, pero entrega su documento completo (o su sección, si el documento es grande). |
+| 🤖 **Agéntico** | El modelo divide la pregunta en búsquedas, busca, revisa si le falta algo y vuelve a buscar. Puedes ver sus pasos. |
 
 **Nuestros resultados** (corpus de la cooperativa, `gpt-oss:20b`, k = 4, RTX 5070 Ti):
 
-| 16 preguntas de referencia | 🧠 CAG | 🔎 RAG |
-|---|---|---|
-| Exactitud | **100 %** | 81 % |
-| Veracidad (nada inventado) | **97 %** | 88 % |
-| Preguntas que necesitan 2 documentos | **100 %** | 33 % |
-| Tokens leídos por pregunta | 4,637 | **916** |
-| Tiempo total por pregunta | 4.1 s | **1.3 s** |
+| 16 preguntas de referencia | 🧠 CAG | 🔎 Clásico | 🔀 Híbrido | 👪 Padre-hijo | 🤖 Agéntico |
+|---|---|---|---|---|---|
+| Exactitud | **100 %** | 84 % | 97 % | 94 % | 97 % |
+| Preguntas que necesitan 2 documentos | **100 %** | 33 % | **100 %** | **100 %** | **100 %** |
+| Tokens leídos por pregunta | 4,637 | 916 | 913 | 2,969 | 1,046 |
+| Tiempo por pregunta | 2.2 s | **1.3 s** | 2.6 s | 3.9 s | 2.6 s |
 
-RAG empata en datos puntuales, cálculos y preguntas trampa, pero falla cuando la
-respuesta está repartida en varios documentos, y una vez **inventó** un dato para
-rellenar lo que su buscador no trajo. El análisis completo, incluida la "paradoja de
-la velocidad", está en la [sección 9 de la teoría](TEORIA.md#9-cag-vs-rag-cara-a-cara).
+El RAG clásico falla cuando la respuesta está repartida en varios documentos, y una vez
+**inventó** un dato para rellenar lo que su buscador no trajo. Las estrategias híbrida,
+padre-hijo y agéntica corrigen esos fallos a cambio de más tiempo o más texto. Solo CAG
+resolvió la pregunta que exige juntar datos dispersos por todo el corpus.
+
+El análisis completo está en la teoría: [sección 9](TEORIA.md#9-cag-vs-rag-cara-a-cara)
+(CAG vs RAG clásico, incluida la "paradoja de la velocidad") y
+[sección 10](TEORIA.md#10-cuatro-bibliotecarios-estrategias-de-rag) (las estrategias).
 
 ### 🗂️ Mapa de archivos
 
 | Archivo | Qué hace |
 |---|---|
 | [`cag_core.py`](cag_core.py) | El motor CAG: prepara el conocimiento, elige `num_ctx`, precalienta la caché y responde. |
-| [`rag_core.py`](rag_core.py) | El rival: trocea, calcula embeddings, busca las *k* fichas más parecidas y responde. |
+| [`rag_core.py`](rag_core.py) | El rival: trocea, calcula embeddings y busca con 4 estrategias (clásica, híbrida, padre-hijo y agéntica). |
 | [`evals.py`](evals.py) | Los jueces (veracidad, relevancia, exactitud y recuperación) y casos para "evaluar al evaluador". |
 | [`comparacion.py`](comparacion.py) | El banco de pruebas CAG vs RAG: corpus, pelea justa, resumen y exportación a JSON. |
 | [`app.py`](app.py) | La puerta de entrada de la app (el índice de páginas). |
@@ -171,17 +184,19 @@ primero* para que calcule mejor); también puedes bajar el límite de la mesa co
    el modelo debe decir que no está en el documento.
 4. **Caza de alucinaciones:** activa *"Permitir conocimiento externo"* y repite la
    pregunta. El juez de Veracidad marcará con ❌ lo que no sale del documento.
-5. **CAG vs RAG:** en la página ⚔️, corre el banco de pruebas y mira la *exactitud por
-   tipo de pregunta*. Después cambia *k* (las fichas que trae RAG) a 1 y a 8 y vuelve a
-   correrlo.
+5. **CAG vs RAG:** en la página ⚔️, haz la pregunta sobre *Nube Morada* con la estrategia
+   🔎 Clásica (inventa un año) y luego con 🤖 Agéntica (abre *"Lo que hizo el buscador"*
+   para ver cómo planea). Después corre la 🏆 liga y mira la *exactitud por tipo de pregunta*.
 
 ### 🖥️ También desde la terminal
 
 ```bash
 python cag_core.py                         # lectura en frío vs. con caché
-python rag_core.py                         # cómo trocea y qué fichas encuentra el buscador
+python rag_core.py                         # la misma pregunta con las 4 estrategias de RAG
 python evals.py                            # pone a prueba a los jueces
 python comparacion.py cooperativa          # banco de pruebas CAG vs RAG → resultados/*.json
+python comparacion.py cooperativa --estrategia agentico   # contra otra estrategia
+python comparacion.py cooperativa --liga   # CAG contra las 4 estrategias (~12 min)
 python comparacion.py paper_cag --descargar
 python -m unittest discover -s pruebas -t .   # pruebas automáticas (sin Ollama, < 1 s)
 ```

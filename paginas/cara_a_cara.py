@@ -6,13 +6,12 @@ Los dos sistemas responden las mismas preguntas, sobre los mismos documentos,
 con el mismo modelo y los mismos jueces. Toda la lógica vive en
 comparacion.py; esta página solo la muestra.
 
-  🥊 Pregunta libre  → una pregunta, dos respuestas lado a lado.
-  🏁 Banco de pruebas → todas las preguntas de referencia, con resumen y JSON.
+  🥊 Pregunta libre      → una pregunta, dos respuestas lado a lado.
+  🏁 Banco de pruebas     → todas las preguntas de referencia, con resumen y JSON.
+  🏆 Liga de estrategias  → CAG contra las 4 estrategias de RAG a la vez.
 """
 
 from __future__ import annotations
-
-import json
 
 import ollama
 import streamlit as st
@@ -21,21 +20,26 @@ from cag_core import DURACIONES_DE_CACHE, MODELO_RECOMENDADO, explicar_error, li
 from comparacion import (
     CORPUS,
     correr_comparacion,
+    correr_liga,
     descargar_paper,
     enfrentar,
     exportar,
     preparar_contendientes,
     resumir,
+    resumir_liga,
 )
 from evals import evaluar_veracidad, semaforo
-from rag_core import FRAGMENTOS_A_RECUPERAR
+from rag_core import ESTRATEGIAS, FRAGMENTOS_A_RECUPERAR
 
 ICONO_EXACTITUD = {"correcta": "✅ correcta", "parcial": "🟡 parcial", "incorrecta": "❌ incorrecta"}
 ICONO_RECUPERACION = {"completa": "✅ completa", "parcial": "🟡 parcial", "nada": "❌ nada"}
 
 st.session_state.setdefault("rivales", None)  # (motor_cag, motor_rag, clave_del_corpus)
 st.session_state.setdefault("pregunta_libre", None)  # el último ResultadoCaraACara de la pregunta libre
-st.session_state.setdefault("banco", None)  # {"resultados": [...], "ruta": Path}
+# Guardamos el JSON en memoria además de en disco: así la descarga funciona
+# aunque alguien borre o mueva el archivo de resultados.
+st.session_state.setdefault("banco", None)  # {"resultados", "ruta", "json", "estrategia"}
+st.session_state.setdefault("liga", None)  # {"resultados", "ruta", "json"}
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -54,6 +58,12 @@ def segundos(valor: float | None, decimales: int = 2) -> str:
 
 def mostrar_respuesta(respuesta, exactitud, veracidad, recuperacion=None):
     """Una columna del cara a cara: respuesta, tiempos y veredictos."""
+    if respuesta.se_quedo_sin_espacio:
+        st.warning(
+            "🌀 **El modelo se quedó razonando en círculos** y llegó al tope de escritura "
+            "antes de terminar. Pasa a veces con preguntas difíciles y mucho contexto: "
+            "vuelve a intentarlo o desactiva *Razonar primero*."
+        )
     st.markdown(respuesta.texto)
     columna_a, columna_b = st.columns(2)
     columna_a.metric(
@@ -66,7 +76,8 @@ def mostrar_respuesta(respuesta, exactitud, veracidad, recuperacion=None):
     )
     lectura = f"📖 Lectura del prompt: {respuesta.medicion.segundos_leyendo:.2f} s"
     if respuesta.fragmentos_recuperados is not None:
-        lectura += f" · 🔎 búsqueda: {respuesta.segundos_buscando * 1000:.0f} ms"
+        busqueda = respuesta.segundos_buscando
+        lectura += f" · 🔎 búsqueda: {busqueda * 1000:.0f} ms" if busqueda < 1 else f" · 🔎 búsqueda: {busqueda:.1f} s"
     st.caption(lectura)
     if exactitud is not None:
         st.markdown(f"**Exactitud:** {ICONO_EXACTITUD.get(exactitud.veredicto, '⚠️ sin veredicto')}")
@@ -79,6 +90,10 @@ def mostrar_respuesta(respuesta, exactitud, veracidad, recuperacion=None):
     if recuperacion is not None:
         st.markdown(f"**Recuperación del buscador:** {ICONO_RECUPERACION.get(recuperacion.veredicto, '⚠️')}")
         st.caption(recuperacion.razonamiento or recuperacion.error or "")
+    if respuesta.pasos_de_busqueda:
+        with st.expander("🧭 Lo que hizo el buscador, paso a paso"):
+            for paso in respuesta.pasos_de_busqueda:
+                st.markdown(f"- {paso}")
     if respuesta.fragmentos_recuperados:
         with st.expander(f"🔎 Las {len(respuesta.fragmentos_recuperados)} fichas que trajo el buscador"):
             for recuperado in respuesta.fragmentos_recuperados:
@@ -110,6 +125,11 @@ with st.expander("⚖️ Las reglas de una pelea justa", expanded=st.session_sta
 el buscador no encuentre la ficha correcta, o que el modelo la tenga y aun así
 responda mal.
 """
+    )
+    st.markdown(
+        "**Las estrategias de RAG** (todas usan el mismo fichero, así que puedes cambiar de "
+        "estrategia sin volver a prepararlo):\n\n"
+        + "\n".join(f"- **{e.nombre}:** {e.descripcion}" for e in ESTRATEGIAS.values())
     )
 
 try:
@@ -223,7 +243,19 @@ st.caption(
 
 st.divider()
 st.subheader("2. Pon a prueba a los rivales")
-pestana_libre, pestana_banco = st.tabs(["🥊 Pregunta libre", "🏁 Banco de pruebas"])
+estrategia = st.radio(
+    "🧭 Estrategia de RAG",
+    options=list(ESTRATEGIAS),
+    format_func=lambda clave: ESTRATEGIAS[clave].nombre,
+    horizontal=True,
+    help="Cómo busca RAG. Se aplica a la pregunta libre y al banco de pruebas; la liga usa las cuatro.",
+)
+st.caption(ESTRATEGIAS[estrategia].descripcion)
+motor_rag.estrategia = estrategia  # mismo fichero, otro bibliotecario: no hace falta volver a indexar
+nombre_rag = f"{ESTRATEGIAS[estrategia].nombre} RAG"
+pestana_libre, pestana_banco, pestana_liga = st.tabs(
+    ["🥊 Pregunta libre", "🏁 Banco de pruebas", "🏆 Liga de estrategias"]
+)
 
 # ════════════════════════════════════════════════════════════════════════════
 # 🥊 PREGUNTA LIBRE
@@ -256,6 +288,7 @@ with pestana_libre:
                         respuesta_rag = motor_rag.preguntar(pregunta["pregunta"])
                         st.session_state.pregunta_libre = {
                             "pregunta": pregunta,
+                            "estrategia": motor_rag.estrategia,
                             "cag": respuesta_cag,
                             "rag": respuesta_rag,
                             "veracidad_cag": evaluar_veracidad(motor_cag, pregunta["pregunta"], respuesta_cag.texto),
@@ -276,7 +309,7 @@ with pestana_libre:
             st.markdown("#### 🧠 CAG")
             mostrar_respuesta(datos["cag"], datos.get("exactitud_cag"), datos["veracidad_cag"])
         with columna_rag:
-            st.markdown("#### 🔎 RAG")
+            st.markdown(f"#### {ESTRATEGIAS[datos['estrategia']].nombre} RAG")
             mostrar_respuesta(datos["rag"], datos.get("exactitud_rag"), datos["veracidad_rag"], datos.get("recuperacion_rag"))
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -285,9 +318,9 @@ with pestana_libre:
 with pestana_banco:
     preguntas = corpus.preguntas()["preguntas"]
     st.markdown(
-        f"Corre las **{len(preguntas)} preguntas de referencia** de *{corpus.nombre}* con ambos "
-        "sistemas y califica cada respuesta con tres jueces. Con gpt-oss:20b en una GPU de 16 GB "
-        "tarda unos 20 segundos por pregunta."
+        f"Corre las **{len(preguntas)} preguntas de referencia** de *{corpus.nombre}* con CAG y "
+        f"con **{nombre_rag}**, y califica cada respuesta con tres jueces. Con gpt-oss:20b en una "
+        "GPU de 16 GB tarda entre 20 y 30 segundos por pregunta."
     )
     if st.button("🏁 Correr el banco de pruebas", type="primary"):
         resultados = []
@@ -297,7 +330,12 @@ with pestana_banco:
                 resultados.append(resultado)
                 barra.progress(numero / len(preguntas), text=f"Pregunta {numero} de {len(preguntas)} lista")
             ruta = exportar(corpus, motor_cag, motor_rag, resultados)
-            st.session_state.banco = {"resultados": resultados, "ruta": ruta}
+            st.session_state.banco = {
+                "resultados": resultados,
+                "ruta": ruta,
+                "json": ruta.read_text("utf-8"),
+                "estrategia": estrategia,
+            }
         except Exception as error:
             st.error(explicar_error(error))
         barra.empty()
@@ -306,6 +344,9 @@ with pestana_banco:
     if banco is not None:
         resultados = banco["resultados"]
         resumen = resumir(resultados)
+        nombre_rag_del_banco = f"{ESTRATEGIAS[banco['estrategia']].nombre} RAG"
+        if banco["estrategia"] != estrategia:
+            st.info(f"Estos resultados son de **{nombre_rag_del_banco}**. Vuelve a correr el banco para ver {nombre_rag}.")
 
         st.markdown("#### 📊 Resumen")
         columna_a, columna_b, columna_c = st.columns(3)
@@ -326,13 +367,13 @@ with pestana_banco:
         )
         st.markdown(
             f"""
-| Promedio por pregunta | 🧠 CAG | 🔎 RAG |
+| Promedio por pregunta | 🧠 CAG | {nombre_rag_del_banco} |
 |---|---|---|
 | Tiempo total | {segundos(resumen['cag']['segundos_totales'])} | {segundos(resumen['rag']['segundos_totales'])} |
 | Primera palabra | {segundos(resumen['cag']['segundos_hasta_primer_token'])} | {segundos(resumen['rag']['segundos_hasta_primer_token'])} |
 | Lectura del prompt | {segundos(resumen['cag']['segundos_leyendo'], 3)} | {segundos(resumen['rag']['segundos_leyendo'], 3)} |
 | Tokens leídos | {resumen['cag']['tokens_leidos']:,.0f} | {resumen['rag']['tokens_leidos']:,.0f} |
-| Búsqueda | — | {resumen['rag']['segundos_buscando'] * 1000:.0f} ms |
+| Búsqueda | — | {segundos(resumen['rag']['segundos_buscando'])} |
 """
         )
 
@@ -377,12 +418,12 @@ with pestana_banco:
                     st.markdown("**🧠 CAG**")
                     mostrar_respuesta(r.cag, r.exactitud_cag, r.veracidad_cag)
                 with columna_rag:
-                    st.markdown("**🔎 RAG**")
+                    st.markdown(f"**{nombre_rag_del_banco}**")
                     mostrar_respuesta(r.rag, r.exactitud_rag, r.veracidad_rag, r.recuperacion_rag)
 
         st.download_button(
             "💾 Descargar los resultados (JSON)",
-            data=banco["ruta"].read_text("utf-8"),
+            data=banco["json"],
             file_name=banco["ruta"].name,
             mime="application/json",
             help="Configuración, preparación, resumen y cada respuesta con sus veredictos.",
@@ -403,3 +444,105 @@ with pestana_banco:
   verdad estadística: cambia *k*, el modelo o el corpus y vuelve a correrlo.
 """
             )
+
+# ════════════════════════════════════════════════════════════════════════════
+# 🏆 LIGA DE ESTRATEGIAS
+# ════════════════════════════════════════════════════════════════════════════
+with pestana_liga:
+    preguntas = corpus.preguntas()["preguntas"]
+    st.markdown(
+        f"CAG contra **las {len(ESTRATEGIAS)} estrategias de RAG** con las {len(preguntas)} preguntas de "
+        f"*{corpus.nombre}*. CAG responde cada pregunta una sola vez y su resultado se compara con "
+        "cada estrategia. Con gpt-oss:20b en una GPU de 16 GB tarda unos 45 segundos por pregunta "
+        f"(~{len(preguntas) * 45 // 60} minutos en total)."
+    )
+    if st.button("🏆 Correr la liga", type="primary"):
+        resultados = []
+        total = len(preguntas) * len(ESTRATEGIAS)
+        barra = st.progress(0.0, text="Empezando…")
+        try:
+            for numero, resultado in enumerate(correr_liga(motor_cag, motor_rag, preguntas), start=1):
+                resultados.append(resultado)
+                barra.progress(
+                    numero / total,
+                    text=f"{resultado.pregunta['id']} · {ESTRATEGIAS[resultado.estrategia].nombre} ({numero} de {total})",
+                )
+            ruta = exportar(corpus, motor_cag, motor_rag, resultados)
+            st.session_state.liga = {"resultados": resultados, "ruta": ruta, "json": ruta.read_text("utf-8")}
+        except Exception as error:
+            st.error(explicar_error(error))
+        barra.empty()
+
+    liga = st.session_state.liga
+    if liga is not None:
+        resumen = resumir_liga(liga["resultados"])
+        sistemas = [("cag", "🧠 CAG")] + [(clave, e.nombre) for clave, e in ESTRATEGIAS.items() if clave in resumen]
+
+        st.markdown("#### 📊 La tabla de la liga")
+        st.dataframe(
+            [
+                {
+                    "Sistema": nombre,
+                    "Exactitud": porcentaje(resumen[clave]["exactitud"]),
+                    "Veracidad": porcentaje(resumen[clave]["veracidad"]),
+                    "Recuperación": porcentaje(resumen[clave].get("recuperacion")),
+                    "Tokens leídos": f"{resumen[clave]['tokens_leidos']:,.0f}",
+                    "Búsqueda": segundos(resumen[clave].get("segundos_buscando"), 1),
+                    "Tiempo total": segundos(resumen[clave]["segundos_totales"], 1),
+                }
+                for clave, nombre in sistemas
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+        st.caption(
+            "Exactitud: ¿coincide con la respuesta correcta? · Veracidad: ¿todo lo que dijo está en los "
+            "documentos? · Recuperación: ¿el buscador trajo lo necesario? · Tokens leídos: cuánto texto "
+            "leyó el modelo en cada pregunta."
+        )
+
+        st.markdown("#### 🧩 Exactitud por tipo de pregunta")
+        st.dataframe(
+            [
+                {"Tipo": tipo, "Preguntas": datos["preguntas"], **{nombre: porcentaje(datos[clave]) for clave, nombre in sistemas}}
+                for tipo, datos in resumen["por_tipo"].items()
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+
+        st.markdown("#### 🔍 Pregunta por pregunta")
+        por_pregunta: dict[str, list] = {}
+        for r in liga["resultados"]:
+            por_pregunta.setdefault(r.pregunta["id"], []).append(r)
+        st.dataframe(
+            [
+                {
+                    "ID": id_,
+                    "Tipo": filas[0].pregunta["tipo"],
+                    "Pregunta": filas[0].pregunta["pregunta"],
+                    "🧠 CAG": ICONO_EXACTITUD.get(filas[0].exactitud_cag.veredicto, "⚠️"),
+                    **{ESTRATEGIAS[r.estrategia].nombre: ICONO_EXACTITUD.get(r.exactitud_rag.veredicto, "⚠️") for r in filas},
+                }
+                for id_, filas in por_pregunta.items()
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+        for id_, filas in por_pregunta.items():
+            with st.expander(f"{id_} · {filas[0].pregunta['pregunta']}"):
+                st.caption(f"Tipo: {filas[0].pregunta['tipo']} · Respuesta correcta: {filas[0].pregunta['respuesta_esperada']}")
+                pestanas = st.tabs(["🧠 CAG"] + [ESTRATEGIAS[r.estrategia].nombre for r in filas])
+                with pestanas[0]:
+                    mostrar_respuesta(filas[0].cag, filas[0].exactitud_cag, filas[0].veracidad_cag)
+                for pestana, r in zip(pestanas[1:], filas):
+                    with pestana:
+                        mostrar_respuesta(r.rag, r.exactitud_rag, r.veracidad_rag, r.recuperacion_rag)
+
+        st.download_button(
+            "💾 Descargar la liga (JSON)",
+            data=liga["json"],
+            file_name=liga["ruta"].name,
+            mime="application/json",
+        )
+        st.caption(f"También se guardó en `{liga['ruta'].relative_to(liga['ruta'].parent.parent)}`.")

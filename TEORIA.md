@@ -244,9 +244,9 @@ texto ve el modelo: todo (CAG) o *k* fichas (RAG).
   exactitud reprobó una respuesta correcta de RAG por añadir un dato extra (que
   era cierto), y el de veracidad aprobó una vez un dato inventado (sección 8).
   Ajustamos ambos y repetimos todo. Moraleja: evalúa también al evaluador.
-- **Los números se mueven un poco.** En las últimas tres corridas, CAG acertó
-  siempre el 100 %, RAG entre el 81 % y el 84 %, y el tiempo de CAG fue de 2.7 a
-  4.1 s: ni el razonamiento ni los jueces son 100 % deterministas.
+- **Los números se mueven un poco.** En todas las corridas CAG acertó el 100 %,
+  el RAG clásico entre el 81 % y el 84 %, y el tiempo de CAG fue de 2.2 a 4.1 s:
+  ni el razonamiento ni los jueces son 100 % deterministas.
 
 > ⚠️ Son 16 preguntas, un modelo y un corpus pequeño (~4,600 tokens). Sirve para
 > entender, no como verdad estadística. Con bibliotecas más grandes, la ventaja
@@ -269,7 +269,69 @@ modelo no puede "saber" las respuestas de memoria.
 
 ---
 
-## 10. Dónde ver cada idea en este proyecto
+## 10. Cuatro bibliotecarios: estrategias de RAG
+
+💡 *RAG no es una sola técnica: hay muchas formas de buscar, y cada una arregla
+un fallo distinto (y a veces crea otro).*
+
+El RAG de la sección 9 es el **clásico**. En la página ⚔️ puedes elegir otras
+tres estrategias, todas sobre el mismo fichero:
+
+| Estrategia | Cómo busca | Qué arregla | Su precio |
+|---|---|---|---|
+| 🔎 **Clásico** | Embeddings: las *k* fichas más parecidas en significado | — (es la base) | Falla con nombres, cifras y respuestas repartidas |
+| 🔀 **Híbrido** | Embeddings + **BM25**, que busca palabras exactas y da más peso a las raras [17]. Las dos listas se unen con **RRF** [18] y el modelo reordena las candidatas (*reranking*) [19] | Términos exactos ("Taza de Excelencia", "Nube Morada") | Una llamada extra al modelo (~1.4 s) |
+| 👪 **Padre-hijo** | Busca fichas pequeñas (precisas), pero entrega su documento o su sección (más contexto) [20] | Datos que están en otra parte del mismo documento | Lee mucho más texto: con documentos pequeños se parece a CAG |
+| 🤖 **Agéntico** | El modelo divide la pregunta en búsquedas [21], busca, revisa si le falta algo y vuelve a buscar [22] | Preguntas que piden varios datos | Varias llamadas al modelo (~1.3 s); depende de que planee bien |
+
+**Lo que aprendimos al construirlas** (antes de escribir el código, medimos):
+
+- **Más técnica no siempre es mejor.** El híbrido sin *reranker* encontraba los
+  nombres exactos, pero perdía la pregunta parafraseada (*"si me lastimo"*):
+  BM25 empujaba fuera la ficha correcta. El *reranker* lo resolvió.
+- **El tamaño del "padre" importa.** Entregar la *sección* no mejoró nada aquí,
+  porque nuestras fichas ya son secciones; entregar el *documento* sí. Por eso la
+  estrategia es adaptativa: documento completo si es corto (≤ 6,000 caracteres),
+  solo la sección si es largo.
+- **La agregación sigue siendo difícil.** Ninguna resolvió *"todas las personas
+  con cargo"*: el agente notó que le faltaba algo, pero su búsqueda extra no
+  encontró los nombres dispersos. Ese es el terreno de **Graph RAG** [23], que
+  antes de buscar extrae entidades y relaciones (persona → cargo).
+- **Un modelo que razona puede quedarse dando vueltas.** Con padre-hijo (tres
+  documentos completos) y la pregunta de agregación, el modelo razonó una vez
+  12,800 tokens durante 82 segundos, llenó la mesa y no llegó a responder. No
+  fue determinista: al repetirla respondió en ~22 s. Por eso el proyecto pone un
+  **tope de escritura** (6,144 tokens) y avisa cuando se alcanza, en vez de
+  mostrar una respuesta vacía sin explicación.
+
+**La liga** (las 16 preguntas, cada estrategia contra CAG):
+
+| 16 preguntas | 🧠 CAG | 🔎 Clásico | 🔀 Híbrido | 👪 Padre-hijo | 🤖 Agéntico |
+|---|---|---|---|---|---|
+| **Exactitud** | **100 %** | 84 % | 97 % | 94 % | 97 % |
+| Preguntas de 2 documentos (3) | **100 %** | 33 % | **100 %** | **100 %** | **100 %** |
+| Agregación (1) | **100 %** | 50 % | 50 % | 0 % | 50 % |
+| Recuperación del buscador | — | 89 % | 96 % | 96 % | 96 % |
+| Tokens leídos por pregunta | 4,637 | 916 | 913 | 2,969 | 1,046 |
+| Tiempo por pregunta | 2.2 s | **1.3 s** | 2.6 s | 3.9 s | 2.6 s |
+
+- **Las tres estrategias nuevas cierran casi toda la brecha** (94–97 % frente al
+  84 % del clásico) y resuelven las preguntas de dos documentos. El precio es el
+  tiempo: el híbrido y el agente gastan ~1.3 s extra en llamadas al modelo, y CAG
+  termina antes que ellos.
+- **La agregación sigue siendo de CAG.** Cuando la respuesta está repartida por
+  todo el corpus, leerlo todo gana. Ninguna estrategia de RAG la resolvió.
+- **Padre-hijo está a medio camino.** Lee 3 veces más que el clásico (el 64 % de
+  lo que lee CAG). En las dos corridas de la liga, se quedó dando vueltas en la
+  pregunta de agregación; el tope de escritura la cortó a los 40 s.
+- **La veracidad no se muestra en la tabla porque engaña aquí.** CAG sacó 93 % y
+  el híbrido 100 %, pero revisamos las 4 afirmaciones de CAG que el juez rechazó y
+  **las 4 eran ciertas**: el juez describió o parafraseó en vez de citar. Las
+  respuestas más largas le dan más ocasiones de citar mal.
+
+---
+
+## 11. Dónde ver cada idea en este proyecto
 
 | Concepto | En el código | En la app |
 |---|---|---|
@@ -285,10 +347,15 @@ modelo no puede "saber" las respuestas de memoria.
 | Búsqueda por similitud | `MotorRAG.buscar()` | ⚔️ → *Las fichas que trajo el buscador* |
 | Exactitud y recuperación | `evaluar_exactitud()` y `evaluar_recuperacion()` | ⚔️ → *Banco de pruebas* |
 | La pelea justa | `preparar_contendientes()` en `comparacion.py` | ⚔️ → *Prepara a los rivales* |
+| BM25 y fusión RRF | `IndiceBM25` y `fusion_rrf()` en `rag_core.py` | ⚔️ → 🔀 Híbrido |
+| *Reranking* con el modelo | `MotorRAG._reordenar()` | ⚔️ → 🔀 Híbrido → *Lo que hizo el buscador* |
+| Padre-hijo | `MotorRAG._buscar_padre_hijo()` | ⚔️ → 👪 Padre-hijo |
+| Agente que planea y revisa | `MotorRAG._buscar_agentico()` | ⚔️ → 🤖 Agéntico → *paso a paso* |
+| La liga de estrategias | `correr_liga()` en `comparacion.py` | ⚔️ → 🏆 *Liga de estrategias* |
 
 ---
 
-## 11. Glosario exprés
+## 12. Glosario exprés
 
 - **Caché KV:** apuntes internos (claves y valores) que el modelo guarda de lo que ya leyó.
 - **Prefill / lectura:** la fase en la que el modelo procesa el prompt. Es lo que la caché acelera.
@@ -300,6 +367,10 @@ modelo no puede "saber" las respuestas de memoria.
 - **Fragmento o ficha (*chunk*):** cada pedazo en que RAG corta los documentos.
 - **Similitud coseno:** qué tan parecidos son dos embeddings (1 = idénticos en significado).
 - **Top-k:** cuántas fichas trae el buscador de RAG en cada pregunta.
+- **BM25:** buscador por palabras exactas; las palabras raras pesan más que las comunes.
+- **RRF (*Reciprocal Rank Fusion*):** forma de unir varias listas ordenadas premiando lo que sale arriba en todas.
+- ***Reranking*:** segunda pasada en la que el modelo lee las candidatas y elige las más útiles.
+- **Agente:** un modelo que decide qué hacer (buscar, revisar, volver a buscar) antes de responder.
 - **Alucinación:** un dato que suena creíble pero no sale de la fuente.
 
 ---
@@ -322,3 +393,10 @@ modelo no puede "saber" las respuestas de memoria.
 14. Nussbaum, Z., Morris, J. X., Duderstadt, B. y Mulyar, A. (2024). *Nomic Embed: Training a Reproducible Long Context Text Embedder.* Transactions on Machine Learning Research (TMLR). [arXiv:2402.01613](https://arxiv.org/abs/2402.01613)
 15. Nomic AI. *Ficha del modelo nomic-embed-text-v1.5* (prefijos de tarea obligatorios): [huggingface.co/nomic-ai/nomic-embed-text-v1.5](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5)
 16. Creative Commons. *Atribución-CompartirIgual 4.0 Internacional (CC BY-SA 4.0)*: [creativecommons.org/licenses/by-sa/4.0/deed.es](https://creativecommons.org/licenses/by-sa/4.0/deed.es)
+17. Robertson, S. y Zaragoza, H. (2009). *The Probabilistic Relevance Framework: BM25 and Beyond.* Foundations and Trends in Information Retrieval, 3(4), 333–389. DOI: [10.1561/1500000019](https://doi.org/10.1561/1500000019)
+18. Cormack, G. V., Clarke, C. L. A. y Büttcher, S. (2009). *Reciprocal Rank Fusion outperforms Condorcet and individual rank learning methods.* SIGIR 2009, pp. 758–759. DOI: [10.1145/1571941.1572114](https://doi.org/10.1145/1571941.1572114)
+19. Sun, W., Yan, L., Ma, X., et al. (2023). *Is ChatGPT Good at Search? Investigating Large Language Models as Re-Ranking Agents.* EMNLP 2023. [arXiv:2304.09542](https://arxiv.org/abs/2304.09542)
+20. Chen, T., Wang, H., Chen, S., et al. (2024). *Dense X Retrieval: What Retrieval Granularity Should We Use?* EMNLP 2024, pp. 15159–15177. [ACL Anthology](https://aclanthology.org/2024.emnlp-main.845/)
+21. Press, O., Zhang, M., Min, S., Schmidt, L., Smith, N. A. y Lewis, M. (2023). *Measuring and Narrowing the Compositionality Gap in Language Models* (método *Self-Ask*). Findings of EMNLP 2023. [arXiv:2210.03350](https://arxiv.org/abs/2210.03350)
+22. Asai, A., Wu, Z., Wang, Y., Sil, A. y Hajishirzi, H. (2024). *Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection.* ICLR 2024. [arXiv:2310.11511](https://arxiv.org/abs/2310.11511)
+23. Edge, D., Trinh, H., Cheng, N., et al. (2024). *From Local to Global: A Graph RAG Approach to Query-Focused Summarization.* Preprint. [arXiv:2404.16130](https://arxiv.org/abs/2404.16130)

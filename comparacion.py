@@ -15,6 +15,12 @@ queremos medir:
 La ÚNICA diferencia: CAG lee TODOS los documentos (desde su caché) y RAG solo
 los fragmentos que trae su buscador.
 
+🏆 LA LIGA DE ESTRATEGIAS
+-------------------------
+RAG tiene varias formas de buscar (ver rag_core.ESTRATEGIAS): clásica, híbrida,
+padre-hijo y agéntica. En la liga, CAG responde cada pregunta UNA vez y luego
+cada estrategia de RAG responde la misma pregunta, con los mismos jueces.
+
 📏 LO QUE MEDIMOS EN CADA PREGUNTA
 ----------------------------------
   ✅ Exactitud     ¿coincide con la respuesta correcta? (juez de exactitud)
@@ -28,8 +34,10 @@ analizarlo o reutilizarlo en otros proyectos.
 
 Ejecuta (con Ollama encendido):
 
-    python comparacion.py cooperativa
-    python comparacion.py paper_cag --descargar   # baja el paper de arXiv la primera vez
+    python comparacion.py cooperativa                       # CAG vs RAG clásico
+    python comparacion.py cooperativa --estrategia hibrido  # CAG vs RAG híbrido
+    python comparacion.py cooperativa --liga                # CAG vs las 4 estrategias
+    python comparacion.py paper_cag --descargar             # baja el paper de arXiv la primera vez
 """
 
 from __future__ import annotations
@@ -59,7 +67,7 @@ from evals import (
     evaluar_recuperacion,
     evaluar_veracidad,
 )
-from rag_core import CARACTERES_POR_FRAGMENTO, FRAGMENTOS_A_RECUPERAR, MotorRAG
+from rag_core import CARACTERES_POR_FRAGMENTO, ESTRATEGIAS, FRAGMENTOS_A_RECUPERAR, MotorRAG
 
 CARPETA_DATOS = Path(__file__).parent / "datos"
 CARPETA_RESULTADOS = Path(__file__).parent / "resultados"
@@ -218,9 +226,10 @@ def descargar_paper(corpus: Corpus) -> Path:
 
 @dataclass
 class ResultadoCaraACara:
-    """Todo lo que pasó con UNA pregunta de referencia."""
+    """Todo lo que pasó con UNA pregunta de referencia y UNA estrategia de RAG."""
 
     pregunta: dict  # la pregunta de preguntas.json (con su respuesta esperada y su tipo)
+    estrategia: str  # la estrategia de RAG que compitió (ver rag_core.ESTRATEGIAS)
     cag: RespuestaDelModelo
     rag: RespuestaDelModelo
     exactitud_cag: ResultadoConVeredicto
@@ -230,36 +239,66 @@ class ResultadoCaraACara:
     recuperacion_rag: ResultadoConVeredicto | None  # None si la respuesta no está en los documentos
 
 
+@dataclass
+class TurnoDeCAG:
+    """La respuesta de CAG a una pregunta, ya calificada (se reutiliza en la liga)."""
+
+    respuesta: RespuestaDelModelo
+    exactitud: ResultadoConVeredicto
+    veracidad: ResultadoVeracidad
+
+
 def preparar_contendientes(
     documentos: list[Documento],
     modelo: str = MODELO_RECOMENDADO,
     razonar: bool = True,
     fragmentos_a_recuperar: int = FRAGMENTOS_A_RECUPERAR,
     duracion_cache: str = "10m",
+    estrategia: str = "clasico",
 ) -> tuple[MotorCAG, MotorRAG]:
     """
     Prepara a los dos rivales con los mismos documentos:
       • CAG lee todo una vez y lo guarda en su caché;
       • RAG trocea e indexa, con la MISMA mesa (num_ctx) que CAG. Si usara otra,
         Ollama tendría que recargar el modelo de chat y CAG perdería su caché.
+    La estrategia de RAG se puede cambiar después (motor_rag.estrategia = ...).
     """
     motor_cag = MotorCAG(modelo, razonar=razonar)
     motor_cag.cargar_conocimiento(documentos, duracion_cache)
-    motor_rag = MotorRAG(modelo, razonar=razonar, fragmentos_a_recuperar=fragmentos_a_recuperar, cliente=motor_cag.cliente)
+    motor_rag = MotorRAG(
+        modelo,
+        razonar=razonar,
+        fragmentos_a_recuperar=fragmentos_a_recuperar,
+        estrategia=estrategia,
+        cliente=motor_cag.cliente,
+    )
     motor_rag.indexar(documentos, num_ctx=motor_cag.num_ctx, duracion_cache=duracion_cache)
     return motor_cag, motor_rag
 
 
-def enfrentar(motor_cag: MotorCAG, motor_rag: MotorRAG, pregunta: dict) -> ResultadoCaraACara:
+def responder_con_cag(motor_cag: MotorCAG, pregunta: dict) -> TurnoDeCAG:
+    """CAG responde y los jueces lo califican."""
+    texto_de_la_pregunta = pregunta["pregunta"]
+    respuesta = motor_cag.preguntar(texto_de_la_pregunta)
+    return TurnoDeCAG(
+        respuesta=respuesta,
+        exactitud=evaluar_exactitud(motor_cag, texto_de_la_pregunta, respuesta.texto, pregunta["respuesta_esperada"]),
+        veracidad=evaluar_veracidad(motor_cag, texto_de_la_pregunta, respuesta.texto),
+    )
+
+
+def enfrentar(
+    motor_cag: MotorCAG, motor_rag: MotorRAG, pregunta: dict, turno_de_cag: TurnoDeCAG | None = None
+) -> ResultadoCaraACara:
     """
     Hace la misma pregunta a ambos y llama a los jueces. Los jueces usan el
     motor CAG porque necesitan ver TODOS los documentos para auditar (y así
-    reutilizan su caché).
+    reutilizan su caché). Si ya tenemos la respuesta de CAG (`turno_de_cag`),
+    no la repetimos.
     """
     texto_de_la_pregunta = pregunta["pregunta"]
     esperada = pregunta["respuesta_esperada"]
-
-    respuesta_cag = motor_cag.preguntar(texto_de_la_pregunta)
+    turno_de_cag = turno_de_cag or responder_con_cag(motor_cag, pregunta)
     respuesta_rag = motor_rag.preguntar(texto_de_la_pregunta)
 
     recuperacion = None
@@ -273,11 +312,12 @@ def enfrentar(motor_cag: MotorCAG, motor_rag: MotorRAG, pregunta: dict) -> Resul
 
     return ResultadoCaraACara(
         pregunta=pregunta,
-        cag=respuesta_cag,
+        estrategia=motor_rag.estrategia,
+        cag=turno_de_cag.respuesta,
         rag=respuesta_rag,
-        exactitud_cag=evaluar_exactitud(motor_cag, texto_de_la_pregunta, respuesta_cag.texto, esperada),
+        exactitud_cag=turno_de_cag.exactitud,
         exactitud_rag=evaluar_exactitud(motor_cag, texto_de_la_pregunta, respuesta_rag.texto, esperada),
-        veracidad_cag=evaluar_veracidad(motor_cag, texto_de_la_pregunta, respuesta_cag.texto),
+        veracidad_cag=turno_de_cag.veracidad,
         veracidad_rag=evaluar_veracidad(motor_cag, texto_de_la_pregunta, respuesta_rag.texto),
         recuperacion_rag=recuperacion,
     )
@@ -286,9 +326,28 @@ def enfrentar(motor_cag: MotorCAG, motor_rag: MotorRAG, pregunta: dict) -> Resul
 def correr_comparacion(
     motor_cag: MotorCAG, motor_rag: MotorRAG, preguntas: list[dict]
 ) -> Iterator[ResultadoCaraACara]:
-    """Enfrenta a los dos sistemas pregunta por pregunta (entrega cada resultado al terminarlo)."""
+    """Enfrenta a CAG con la estrategia actual de RAG, pregunta por pregunta."""
     for pregunta in preguntas:
         yield enfrentar(motor_cag, motor_rag, pregunta)
+
+
+def correr_liga(
+    motor_cag: MotorCAG, motor_rag: MotorRAG, preguntas: list[dict], estrategias: list[str] | None = None
+) -> Iterator[ResultadoCaraACara]:
+    """
+    🏆 La liga: en cada pregunta, CAG responde UNA vez y después responde cada
+    estrategia de RAG. Entrega un resultado por cada (pregunta, estrategia).
+    """
+    estrategias = estrategias or list(ESTRATEGIAS)
+    estrategia_original = motor_rag.estrategia
+    try:
+        for pregunta in preguntas:
+            turno_de_cag = responder_con_cag(motor_cag, pregunta)
+            for estrategia in estrategias:
+                motor_rag.estrategia = estrategia
+                yield enfrentar(motor_cag, motor_rag, pregunta, turno_de_cag)
+    finally:
+        motor_rag.estrategia = estrategia_original
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -334,13 +393,38 @@ def resumir(resultados: list[ResultadoCaraACara]) -> dict:
     return resumen
 
 
+def resumir_liga(resultados: list[ResultadoCaraACara]) -> dict:
+    """
+    Resumen de la liga: CAG (una sola vez, porque respondió una vez por pregunta)
+    y cada estrategia de RAG, más la exactitud por tipo de pregunta de todos.
+    """
+    por_estrategia: dict[str, list[ResultadoCaraACara]] = {}
+    for resultado in resultados:
+        por_estrategia.setdefault(resultado.estrategia, []).append(resultado)
+    resumenes = {estrategia: resumir(grupo) for estrategia, grupo in por_estrategia.items()}
+    primero = next(iter(resumenes.values()))
+    liga = {"cag": primero["cag"], **{estrategia: r["rag"] for estrategia, r in resumenes.items()}}
+    liga["por_tipo"] = {
+        tipo: {
+            "preguntas": datos["preguntas"],
+            "cag": datos["exactitud_cag"],
+            **{estrategia: resumenes[estrategia]["por_tipo"][tipo]["exactitud_rag"] for estrategia in resumenes},
+        }
+        for tipo, datos in primero["por_tipo"].items()
+    }
+    return liga
+
+
 def exportar(
     corpus: Corpus, motor_cag: MotorCAG, motor_rag: MotorRAG, resultados: list[ResultadoCaraACara]
 ) -> Path:
     """Guarda TODO (configuración, preparación, resumen y cada respuesta) en un JSON."""
     CARPETA_RESULTADOS.mkdir(exist_ok=True)
+    estrategias = list(dict.fromkeys(resultado.estrategia for resultado in resultados))
+    es_liga = len(estrategias) > 1
     marca_de_tiempo = datetime.now().strftime("%Y%m%d_%H%M%S")
-    destino = CARPETA_RESULTADOS / f"comparacion_{corpus.clave}_{marca_de_tiempo}.json"
+    prefijo = "liga" if es_liga else f"comparacion_{estrategias[0]}"
+    destino = CARPETA_RESULTADOS / f"{prefijo}_{corpus.clave}_{marca_de_tiempo}.json"
     carga = motor_cag.informe_de_carga
     indice = motor_rag.informe_de_indexado
     contenido = {
@@ -354,6 +438,7 @@ def exportar(
             "modelo_de_embeddings": motor_rag.modelo_de_embeddings,
             "fragmentos_a_recuperar": motor_rag.fragmentos_a_recuperar,
             "caracteres_por_fragmento": CARACTERES_POR_FRAGMENTO,
+            "estrategias_de_rag": estrategias,
         },
         "preparacion": {
             "cag": {
@@ -368,7 +453,7 @@ def exportar(
                 "segundos_indexando": indice.segundos_indexando,
             },
         },
-        "resumen": resumir(resultados),
+        "resumen": resumir_liga(resultados) if es_liga else resumir(resultados),
         "resultados": [asdict(resultado) for resultado in resultados],
     }
     destino.write_text(json.dumps(contenido, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -389,6 +474,8 @@ if __name__ == "__main__":
     parser.add_argument("corpus", choices=list(CORPUS), help="qué conjunto de documentos usar")
     parser.add_argument("--modelo", default=MODELO_RECOMENDADO, help="modelo de chat de Ollama")
     parser.add_argument("--k", type=int, default=FRAGMENTOS_A_RECUPERAR, help="fragmentos que recupera RAG")
+    parser.add_argument("--estrategia", choices=list(ESTRATEGIAS), default="clasico", help="estrategia de RAG")
+    parser.add_argument("--liga", action="store_true", help="enfrenta a CAG con las 4 estrategias de RAG")
     parser.add_argument("--sin-razonar", action="store_true", help="desactiva el razonamiento previo")
     parser.add_argument("--descargar", action="store_true", help="descarga el corpus si no está")
     argumentos = parser.parse_args()
@@ -401,30 +488,38 @@ if __name__ == "__main__":
         print(f"   Guardado en {descargar_paper(corpus)}")
 
     preguntas = corpus.preguntas()["preguntas"]
-    print(f"🥊 {corpus.nombre}: {len(preguntas)} preguntas, modelo {argumentos.modelo}, k={argumentos.k}")
+    estrategias = list(ESTRATEGIAS) if argumentos.liga else [argumentos.estrategia]
+    print(
+        f"🥊 {corpus.nombre}: {len(preguntas)} preguntas, modelo {argumentos.modelo}, k={argumentos.k}, "
+        f"RAG: {', '.join(ESTRATEGIAS[e].nombre for e in estrategias)}"
+    )
     inicio = time.perf_counter()
     motor_cag, motor_rag = preparar_contendientes(
-        corpus.documentos(), argumentos.modelo, not argumentos.sin_razonar, argumentos.k
+        corpus.documentos(), argumentos.modelo, not argumentos.sin_razonar, argumentos.k, estrategia=estrategias[0]
     )
 
+    ICONO = {"correcta": "✅", "parcial": "🟡", "incorrecta": "❌"}
     resultados = []
-    print(f"\n{'id':4} {'tipo':20} {'Exactitud CAG':>14} {'Exactitud RAG':>14} {'Recup. RAG':>11}")
-    for resultado in correr_comparacion(motor_cag, motor_rag, preguntas):
+    print(f"\n{'id':4} {'tipo':20} {'CAG':>4} " + " ".join(f"{e[:10]:>10}" for e in estrategias))
+    fila: list[ResultadoCaraACara] = []
+    for resultado in correr_liga(motor_cag, motor_rag, preguntas, estrategias):
         resultados.append(resultado)
-        recuperacion = resultado.recuperacion_rag.puntaje if resultado.recuperacion_rag else None
-        print(
-            f"{resultado.pregunta['id']:4} {resultado.pregunta['tipo']:20} "
-            f"{resultado.exactitud_cag.veredicto:>14} {resultado.exactitud_rag.veredicto:>14} "
-            f"{_porcentaje(recuperacion):>11}"
-        )
+        fila.append(resultado)
+        if len(fila) == len(estrategias):  # ya respondieron todas: imprimimos la fila
+            print(
+                f"{resultado.pregunta['id']:4} {resultado.pregunta['tipo']:20} "
+                f"{ICONO.get(resultado.exactitud_cag.veredicto, '⚠️'):>3} "
+                + " ".join(f"{ICONO.get(r.exactitud_rag.veredicto, '⚠️'):>9}" for r in fila)
+            )
+            fila = []
 
-    resumen = resumir(resultados)
-    print("\n📊 Resumen          CAG       RAG")
-    for nombre, clave in [("Exactitud", "exactitud"), ("Veracidad", "veracidad")]:
-        print(f"   {nombre:15} {_porcentaje(resumen['cag'][clave]):>6}    {_porcentaje(resumen['rag'][clave]):>6}")
-    for nombre, clave in [("Tiempo total (s)", "segundos_totales"), ("Lectura (s)", "segundos_leyendo")]:
-        print(f"   {nombre:15} {resumen['cag'][clave]:6.2f}    {resumen['rag'][clave]:6.2f}")
-    print(f"   {'Tokens leídos':15} {resumen['cag']['tokens_leidos']:6.0f}    {resumen['rag']['tokens_leidos']:6.0f}")
-    print(f"   Recuperación de RAG: {_porcentaje(resumen['rag']['recuperacion'])}")
+    resumen = resumir_liga(resultados)
+    sistemas = ["cag", *estrategias]
+    print("\n📊 Resumen" + " " * 14 + " ".join(f"{s[:10]:>10}" for s in sistemas))
+    for nombre, clave in [("Exactitud", "exactitud"), ("Veracidad", "veracidad"), ("Recuperación", "recuperacion")]:
+        print(f"   {nombre:20}" + " ".join(f"{_porcentaje(resumen[s].get(clave)):>10}" for s in sistemas))
+    for nombre, clave in [("Tiempo total (s)", "segundos_totales"), ("Búsqueda (s)", "segundos_buscando")]:
+        print(f"   {nombre:20}" + " ".join(f"{(resumen[s].get(clave) or 0):>10.2f}" for s in sistemas))
+    print(f"   {'Tokens leídos':20}" + " ".join(f"{resumen[s]['tokens_leidos']:>10.0f}" for s in sistemas))
     print(f"\n💾 Resultados en {exportar(corpus, motor_cag, motor_rag, resultados)}")
     print(f"⏱️ {time.perf_counter() - inicio:.0f} s en total")

@@ -101,6 +101,13 @@ TOLERANCIA_DE_TOKENS = 256
 # Los documentos de ejemplo: cuatro textos ficticios de una cooperativa cafetalera.
 CARPETA_CORPUS_DE_EJEMPLO = Path(__file__).parent / "datos" / "cooperativa"
 
+# Tope de seguridad para lo que escribe el modelo en cada respuesta (razonamiento
+# interno + respuesta). Lo normal son unos cientos de tokens; las preguntas
+# difíciles con mucho contexto pueden llegar a ~4,000. Pero un modelo que razona
+# a veces se queda "dando vueltas" y llenaría la mesa entera sin responder: el
+# tope evita esperar minutos por una respuesta vacía.
+MAXIMO_DE_TOKENS_POR_RESPUESTA = 6_144
+
 # Para la proyección educativa: "¿cuánto tardaría en releer un libro grande?"
 TOKENS_DE_UN_LIBRO_GRANDE = 100_000
 
@@ -245,9 +252,13 @@ class RespuestaDelModelo:
     razonamiento: str  # lo que el modelo "pensó" antes de responder (si razona)
     prompt_recortado: bool  # ⚠️ True si el libro no cupo completo en la mesa
     cache_rota_a_proposito: bool = False
-    # Solo en RAG: los fragmentos que trajo el buscador y cuánto tardó en buscarlos.
+    # True si el modelo llegó al tope de tokens (normalmente: razonó en círculos).
+    se_quedo_sin_espacio: bool = False
+    # Solo en RAG: los fragmentos que trajo el buscador, cuánto tardó en
+    # buscarlos y la bitácora de lo que hizo (útil en las estrategias avanzadas).
     fragmentos_recuperados: list | None = None
     segundos_buscando: float = 0.0
+    pasos_de_busqueda: list[str] | None = None
 
 
 class ConocimientoDemasiadoGrande(ValueError):
@@ -536,8 +547,11 @@ class MotorCAG:
         instrucciones = (
             INSTRUCCIONES_MODO_LIBRE if permitir_conocimiento_externo else INSTRUCCIONES_MODO_ESTRICTO
         )
+        parametros = self.parametros_base()
         parametros_de_la_peticion = {
-            **self.parametros_base(),
+            **parametros,
+            # El mismo tope de escritura para CAG y RAG (ver MAXIMO_DE_TOKENS_POR_RESPUESTA).
+            "options": {**parametros["options"], "num_predict": MAXIMO_DE_TOKENS_POR_RESPUESTA},
             "messages": [
                 # 1) El mensaje de sistema empieza con el conocimiento (prefijo estable).
                 {"role": "system", "content": self.prompt_de_sistema(instrucciones, romper_cache)},
@@ -617,6 +631,7 @@ class RespuestaEnVivo:
             # 🚨 Si Ollama leyó menos tokens de los que sabemos que tiene el
             # prompt, es que lo recortó en silencio.
             prompt_recortado=medicion.tokens_del_prompt < self._tokens_minimos_esperados,
+            se_quedo_sin_espacio=ultimo_fragmento.done_reason == "length",
             cache_rota_a_proposito=self._romper_cache,
         )
 

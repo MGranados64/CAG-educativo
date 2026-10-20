@@ -337,6 +337,8 @@ with panel_chat:
                 with st.chat_message("user"):
                     st.markdown(respuesta.pregunta)
                 with st.chat_message("assistant"):
+                    if respuesta.se_quedo_sin_espacio:
+                        st.warning("🌀 El modelo se quedó razonando en círculos y no terminó de responder.")
                     st.markdown(respuesta.texto)
                     st.caption(
                         f"#{numero} · 📖 leyó el prompt en {respuesta.medicion.segundos_leyendo:.2f} s "
@@ -420,6 +422,12 @@ with panel_transparencia:
         )
 
         # El diagnóstico, en orden de gravedad.
+        if respuesta.se_quedo_sin_espacio:
+            st.warning(
+                "🌀 **El modelo se quedó razonando en círculos** y llegó al tope de escritura "
+            "antes de terminar. Pasa a veces con preguntas difíciles y mucho contexto: "
+            "vuelve a intentarlo o desactiva *Razonar primero*."
+            )
         if respuesta.prompt_recortado:
             st.error(
                 "🚨 **El libro no llegó completo.** Ollama leyó menos tokens de los que ocupa "

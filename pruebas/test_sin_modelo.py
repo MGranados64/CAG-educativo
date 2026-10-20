@@ -11,12 +11,17 @@ Ejecuta desde la carpeta del proyecto:
     python -m unittest discover -s pruebas -t . -v
 """
 
+import json
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
+
 from cag_core import (
+    RespuestaEnVivo,
     Documento,
     MedicionDeTiempos,
     calcular_tamano_de_mesa,
@@ -25,7 +30,15 @@ from cag_core import (
 )
 from comparacion import CORPUS, _ExtractorDeTexto
 from evals import PUNTAJE_DE_EXACTITUD, PUNTAJE_DE_RECUPERACION, cita_verificada, semaforo
-from rag_core import partir_texto_largo, prefijos_para, trocear_documento
+from rag_core import (
+    IndiceBM25,
+    MotorRAG,
+    fusion_rrf,
+    palabras_para_buscar,
+    partir_texto_largo,
+    prefijos_para,
+    trocear_documento,
+)
 
 
 class PruebasDelConocimientoEnCache(unittest.TestCase):
@@ -173,6 +186,146 @@ class PruebasDelExtractorHTML(unittest.TestCase):
         self.assertIn("- first", texto)
         self.assertNotIn("A reference", texto)
         self.assertNotIn("no()", texto)
+
+
+class PruebasDeLaBusquedaPorPalabras(unittest.TestCase):
+    def test_quita_acentos_mayusculas_y_palabras_vacias(self):
+        self.assertEqual(palabras_para_buscar("¿Cuántas BECAS de la Cooperativa?"), ["becas", "cooperativa"])
+
+    def test_bm25_premia_la_palabra_rara(self):
+        indice = IndiceBM25(["café café café", "café y glifosato", "café de altura"])
+        puntajes = indice.puntajes("glifosato café")
+        self.assertEqual(int(np.argmax(puntajes)), 1)  # "glifosato" solo está en una ficha
+
+    def test_rrf_premia_estar_arriba_en_las_dos_listas(self):
+        # La ficha 2 es segunda en ambas listas; la 1 es primera en una y no aparece en la otra.
+        self.assertEqual(fusion_rrf([[1, 2, 3], [4, 2, 5]])[0], 2)
+
+
+class ClienteSimulado:
+    """
+    Imita a Ollama sin modelo: embeddings deterministas (por palabras) y
+    respuestas JSON programables, para probar las estrategias de RAG.
+    """
+
+    def __init__(self, respuestas_json: list[str] | None = None):
+        self.respuestas_json = list(respuestas_json or [])
+        self.llamadas_al_chat = 0
+
+    def show(self, nombre):
+        return SimpleNamespace(
+            details=SimpleNamespace(family="gptoss", parameter_size="20B", quantization_level="Q4"),
+            modelinfo={"general.architecture": "gptoss", "gptoss.context_length": 131072},
+            capabilities=["completion", "thinking"],
+        )
+
+    def embed(self, model, input, keep_alive=None):
+        vectores = []
+        for texto in input:
+            vector = np.zeros(64)
+            for palabra in palabras_para_buscar(texto):
+                vector[zlib.crc32(palabra.encode()) % 64] += 1
+            vectores.append(vector + 1e-6)
+        return SimpleNamespace(embeddings=vectores)
+
+    def chat(self, **parametros):
+        self.llamadas_al_chat += 1
+        contenido = self.respuestas_json.pop(0) if self.respuestas_json else "{}"
+        return SimpleNamespace(message=SimpleNamespace(content=contenido))
+
+
+class PruebasDeLasEstrategiasDeRAG(unittest.TestCase):
+    DOCUMENTOS = [
+        Documento("corto.md", "# Corto\n\n## Fundación\n\nSe fundó en 1987.\n\n## Variedad\n\nLa variedad Nube Morada se registró en 2011."),
+        Documento("largo.md", "# Largo\n\n## Producción\n\n" + "Se produjeron 83 toneladas de café. " * 200
+                  + "\n\n## Tienda\n\nLa tienda cierra los martes."),
+    ]
+
+    def motor(self, respuestas_json=None, estrategia="clasico"):
+        motor = MotorRAG(cliente=ClienteSimulado(respuestas_json), estrategia=estrategia, fragmentos_a_recuperar=2)
+        motor.indexar(self.DOCUMENTOS)
+        return motor
+
+    def test_padre_hijo_entrega_documento_si_es_corto_y_seccion_si_es_largo(self):
+        motor = self.motor(estrategia="padre_hijo")
+        padres = motor.buscar("¿Cuántas toneladas de café se produjeron?").recuperados
+        por_documento = {p.fragmento.documento: p.fragmento for p in padres}
+        self.assertEqual(por_documento["largo.md"].seccion, "Producción")  # documento largo: solo su sección
+        self.assertNotIn("martes", por_documento["largo.md"].texto)
+        if "corto.md" in por_documento:
+            self.assertEqual(por_documento["corto.md"].seccion, "documento completo")
+
+    def test_pedir_json_reintenta_si_no_cumple_el_esquema(self):
+        motor = self.motor(['{"fichas": [0]}', '{"elegidas": [1, 0]}'])
+        elegidas = motor._reordenar("pregunta", [5, 6, 7], cuantas=2)
+        self.assertEqual(elegidas, [6, 5])  # usó la segunda respuesta (la que sí cumple)
+        self.assertEqual(motor.cliente.llamadas_al_chat, 2)
+
+    def test_reordenar_completa_si_el_modelo_elige_pocas(self):
+        motor = self.motor(['{"elegidas": [2]}'])
+        self.assertEqual(motor._reordenar("pregunta", [5, 6, 7], cuantas=3), [7, 5, 6])
+
+    def test_reordenar_sobrevive_si_el_modelo_falla_siempre(self):
+        motor = self.motor(["no es json", "tampoco"])
+        self.assertEqual(motor._reordenar("pregunta", [5, 6, 7], cuantas=2), [5, 6])
+
+    def test_el_agente_planea_busca_revisa_y_no_repite_fichas(self):
+        motor = self.motor(
+            [
+                json.dumps({"busquedas": ["año registro Nube Morada", "registro variedad Nube Morada"]}),
+                json.dumps({"falta": "", "suficiente": True, "nueva_busqueda": ""}),
+            ],
+            estrategia="agentico",
+        )
+        busqueda = motor.buscar("¿En qué año se registró la variedad Nube Morada?")
+        numeros = [r.fragmento.numero for r in busqueda.recuperados]
+        self.assertEqual(len(numeros), len(set(numeros)))  # sin fichas repetidas
+        self.assertTrue(any("2011" in r.fragmento.texto for r in busqueda.recuperados))
+        self.assertTrue(busqueda.pasos[0].startswith("🧭"))
+        self.assertTrue(any(paso.startswith("🤔") for paso in busqueda.pasos))
+
+    def test_cambiar_de_estrategia_no_cambia_la_mesa(self):
+        motor = self.motor()
+        mesa = motor.num_ctx
+        for estrategia in ("hibrido", "padre_hijo", "agentico"):
+            motor.estrategia = estrategia
+            self.assertEqual(motor.num_ctx, mesa)  # otra mesa obligaría a Ollama a recargar el modelo
+
+
+
+class PruebasDeLaRespuestaEnVivo(unittest.TestCase):
+    @staticmethod
+    def fragmento(pensamiento="", texto="", fin=None, generados=None):
+        return SimpleNamespace(
+            message=SimpleNamespace(thinking=pensamiento, content=texto),
+            done_reason=fin,
+            prompt_eval_count=100 if fin else None,
+            prompt_eval_duration=1_000_000 if fin else None,
+            eval_count=generados,
+            eval_duration=1_000_000_000 if fin else None,
+            load_duration=0,
+        )
+
+    def respuesta(self, fragmentos):
+        cliente = SimpleNamespace(chat=lambda **parametros: iter(fragmentos))
+        en_vivo = RespuestaEnVivo(cliente, {"model": "modelo-de-prueba"}, "¿pregunta?")
+        texto = "".join(en_vivo)
+        return texto, en_vivo.resultado
+
+    def test_marca_cuando_el_modelo_se_queda_razonando_sin_responder(self):
+        texto, resultado = self.respuesta(
+            [self.fragmento(pensamiento="mmm… "), self.fragmento(pensamiento="mmm… ", fin="length", generados=6144)]
+        )
+        self.assertEqual(texto, "")
+        self.assertTrue(resultado.se_quedo_sin_espacio)
+        self.assertEqual(resultado.razonamiento, "mmm… mmm… ")
+
+    def test_una_respuesta_normal_no_se_marca(self):
+        texto, resultado = self.respuesta(
+            [self.fragmento(pensamiento="pienso"), self.fragmento(texto="Hola"), self.fragmento(fin="stop", generados=5)]
+        )
+        self.assertEqual(texto, "Hola")
+        self.assertFalse(resultado.se_quedo_sin_espacio)
 
 
 if __name__ == "__main__":
