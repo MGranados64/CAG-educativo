@@ -14,12 +14,11 @@ clic en algo; lo que debe "sobrevivir" entre clics se guarda en
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import ollama
 import streamlit as st
 
 from cag_core import (
+    CARPETA_CORPUS_DE_EJEMPLO,
     DURACIONES_DE_CACHE,
     MODELO_RECOMENDADO,
     TOKENS_DE_UN_LIBRO_GRANDE,
@@ -27,12 +26,14 @@ from cag_core import (
     Documento,
     MotorCAG,
     explicar_error,
+    cargar_documentos_de_carpeta,
     extraer_texto,
     listar_modelos_de_chat,
 )
 from evals import evaluar_respuesta, semaforo
 
-RUTA_DOCUMENTO_EJEMPLO = Path(__file__).parent.parent / "datos" / "manual_cooperativa_nube_alta.md"
+# Los nombres de los documentos de ejemplo (para saber si mostrar preguntas sugeridas).
+DOCUMENTOS_DE_EJEMPLO = {documento.nombre for documento in cargar_documentos_de_carpeta(CARPETA_CORPUS_DE_EJEMPLO)}
 
 PREGUNTAS_SUGERIDAS = [
     "¿Cuántos días de vacaciones tiene un empleado en su tercer año?",
@@ -68,7 +69,7 @@ def historial_para_el_modelo(turnos: list[dict]) -> list[dict]:
 # 🧭 BARRA LATERAL: experimentos
 # ════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
-    st.page_link("paginas/teoria.py", label="Leer la teoría (10 min)", icon="📖")
+    st.page_link("paginas/teoria.py", label="Leer la teoría (12 min)", icon="📖")
     st.header("🧪 Experimentos")
     permitir_conocimiento_externo = st.toggle(
         "Permitir conocimiento externo",
@@ -188,11 +189,12 @@ with panel_carga:
         ),
     )
     usar_documento_ejemplo = st.checkbox(
-        "Incluir documento de ejemplo",
+        "Incluir documentos de ejemplo",
         value=True,
         help=(
-            "Un manual FICTICIO de una cooperativa cafetalera. Como todo es inventado, "
-            "es fácil notar cuándo el modelo responde con algo que no está escrito ahí."
+            "Cuatro documentos FICTICIOS de una cooperativa cafetalera: manual, informe "
+            "anual, acta de asamblea y protocolo de calidad. Como todo es inventado, es "
+            "fácil notar cuándo el modelo responde con algo que no está escrito ahí."
         ),
     )
     texto_pegado = st.text_area(
@@ -229,14 +231,12 @@ with panel_carga:
             for archivo in archivos_subidos or []
         ]
         if usar_documento_ejemplo:
-            documentos.append(
-                Documento(RUTA_DOCUMENTO_EJEMPLO.name, RUTA_DOCUMENTO_EJEMPLO.read_text("utf-8"))
-            )
+            documentos.extend(cargar_documentos_de_carpeta(CARPETA_CORPUS_DE_EJEMPLO))
         if texto_pegado.strip():
             documentos.append(Documento("texto_pegado.txt", texto_pegado))
 
         if not documentos:
-            st.warning("Primero sube un archivo, pega texto o marca el documento de ejemplo.")
+            st.warning("Primero sube un archivo, pega texto o marca los documentos de ejemplo.")
         else:
             try:
                 with st.spinner("Cargando el modelo y leyendo el libro… (la primera vez tarda más)"):
@@ -337,6 +337,8 @@ with panel_chat:
                 with st.chat_message("user"):
                     st.markdown(respuesta.pregunta)
                 with st.chat_message("assistant"):
+                    if respuesta.se_quedo_sin_espacio:
+                        st.warning("🌀 El modelo se quedó razonando en círculos y no terminó de responder.")
                     st.markdown(respuesta.texto)
                     st.caption(
                         f"#{numero} · 📖 leyó el prompt en {respuesta.medicion.segundos_leyendo:.2f} s "
@@ -344,7 +346,7 @@ with panel_chat:
                     )
 
         pregunta_sugerida = None
-        if RUTA_DOCUMENTO_EJEMPLO.name in motor.documentos_cargados:
+        if DOCUMENTOS_DE_EJEMPLO & set(motor.documentos_cargados):
             with st.expander("💡 Preguntas de ejemplo"):
                 for sugerencia in PREGUNTAS_SUGERIDAS:
                     if st.button(sugerencia, key=f"sugerencia-{sugerencia}", width="stretch"):
@@ -420,6 +422,12 @@ with panel_transparencia:
         )
 
         # El diagnóstico, en orden de gravedad.
+        if respuesta.se_quedo_sin_espacio:
+            st.warning(
+                "🌀 **El modelo se quedó razonando en círculos** y llegó al tope de escritura "
+            "antes de terminar. Pasa a veces con preguntas difíciles y mucho contexto: "
+            "vuelve a intentarlo o desactiva *Razonar primero*."
+            )
         if respuesta.prompt_recortado:
             st.error(
                 "🚨 **El libro no llegó completo.** Ollama leyó menos tokens de los que ocupa "
@@ -617,7 +625,8 @@ inyectar: si ahora "leyó" mucho más rápido, es porque reutilizó la caché.
 
 **Veracidad (Faithfulness)** — inspirada en RAGas:
 1. Un juez divide la respuesta en *afirmaciones atómicas* (un hecho por frase).
-2. Para cada una busca la **cita textual** del documento que la respalda.
+2. Para cada una busca la **cita textual** del documento que la respalda, y
+   Python comprueba que esa cita exista de verdad (no le creemos sin pruebas).
 3. `puntaje = afirmaciones respaldadas ÷ afirmaciones totales` (lo calcula Python, no el modelo).
 
 **Relevancia (Answer Relevancy)** — adaptada de RAGas:
