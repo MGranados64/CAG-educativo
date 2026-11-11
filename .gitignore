@@ -15,5 +15,11 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+# Resultados de los bancos de pruebas (se generan al correrlos)
+resultados/
+
+# Paper descargado bajo demanda (CC BY-SA 4.0, ver datos/paper_cag/_LEEME.md)
+datos/paper_cag/paper_cag.md
+
 # Configuración local de herramientas
 .claude/

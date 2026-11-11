@@ -1,0 +1,93 @@
+{
+  "corpus": "Paper de CAG (Chan et al., 2025)",
+  "idioma": "en",
+  "descripcion": "El artículo que propuso CAG. Las preguntas están en inglés, como el paper, porque el buscador de RAG (nomic-embed-text) funciona mucho mejor cuando pregunta y texto están en el mismo idioma. Las respuestas esperadas se verificaron contra el texto del artículo (v2).",
+  "licencia": "El artículo se distribuye bajo CC BY-SA 4.0 y NO se incluye en el repositorio: la app lo descarga de arXiv cuando lo pides. Las preguntas y respuestas de este archivo son paráfrasis breves creadas para este proyecto.",
+  "fuente": {
+    "cita": "Chan, B. J., Chen, C.-T., Cheng, J.-H. y Huang, H.-H. (2025). Don't Do RAG: When Cache-Augmented Generation is All You Need for Knowledge Tasks. The ACM Web Conference 2025 (WWW '25), artículo corto.",
+    "url": "https://arxiv.org/abs/2412.15605",
+    "licencia": "CC BY-SA 4.0 — https://creativecommons.org/licenses/by-sa/4.0/"
+  },
+  "preguntas": [
+    {
+      "id": "p01",
+      "tipo": "dato_puntual",
+      "pregunta": "Which LLM was used in all the experiments?",
+      "respuesta_esperada": "Llama 3.1 8B.",
+      "en_documentos": true,
+      "documentos_fuente": ["paper_cag.md"]
+    },
+    {
+      "id": "p02",
+      "tipo": "dato_puntual",
+      "pregunta": "What hardware were the experiments run on?",
+      "respuesta_esperada": "Eight Tesla V100 GPUs with 32 GB each (Tesla V100 32G x8).",
+      "en_documentos": true,
+      "documentos_fuente": ["paper_cag.md"]
+    },
+    {
+      "id": "p03",
+      "tipo": "dato_puntual",
+      "pregunta": "Which metric was used to evaluate the generated answers?",
+      "respuesta_esperada": "BERTScore, measuring the similarity between generated answers and ground-truth answers.",
+      "en_documentos": true,
+      "documentos_fuente": ["paper_cag.md"]
+    },
+    {
+      "id": "p04",
+      "tipo": "agregacion",
+      "pregunta": "What are the three phases of the CAG method?",
+      "respuesta_esperada": "External knowledge preloading, inference, and cache reset.",
+      "en_documentos": true,
+      "documentos_fuente": ["paper_cag.md"]
+    },
+    {
+      "id": "p05",
+      "tipo": "parafraseo",
+      "pregunta": "How does CAG get back to its initial state after answering a query?",
+      "respuesta_esperada": "It resets the KV cache by truncating the new tokens that were appended during inference, which restores the preloaded knowledge state.",
+      "en_documentos": true,
+      "documentos_fuente": ["paper_cag.md"]
+    },
+    {
+      "id": "p06",
+      "tipo": "multi_seccion",
+      "pregunta": "Which two retrieval baselines were compared with CAG, and how does each one retrieve information?",
+      "respuesta_esperada": "A sparse baseline using BM25, which ranks documents by term frequency-inverse document frequency and document length normalization, and a dense baseline using OpenAI indexes, which represent documents and queries with dense embeddings in a shared semantic space.",
+      "en_documentos": true,
+      "documentos_fuente": ["paper_cag.md"]
+    },
+    {
+      "id": "p07",
+      "tipo": "dato_tabla",
+      "pregunta": "How many documents and tokens does the large HotPotQA configuration contain?",
+      "respuesta_esperada": "64 documents and about 85k tokens.",
+      "en_documentos": true,
+      "documentos_fuente": ["paper_cag.md"]
+    },
+    {
+      "id": "p08",
+      "tipo": "dato_puntual",
+      "pregunta": "Which two datasets were used in the experiments?",
+      "respuesta_esperada": "SQuAD and HotPotQA.",
+      "en_documentos": true,
+      "documentos_fuente": ["paper_cag.md"]
+    },
+    {
+      "id": "p09",
+      "tipo": "dato_puntual",
+      "pregunta": "For which kinds of applications do the authors say CAG is a good fit?",
+      "respuesta_esperada": "Applications whose knowledge source has a manageable size, such as internal knowledge bases of small companies, FAQs and call centers.",
+      "en_documentos": true,
+      "documentos_fuente": ["paper_cag.md"]
+    },
+    {
+      "id": "p10",
+      "tipo": "fuera_del_documento",
+      "pregunta": "What learning rate was used to fine-tune the model?",
+      "respuesta_esperada": "That information does not appear in the document.",
+      "en_documentos": false,
+      "documentos_fuente": []
+    }
+  ]
+}

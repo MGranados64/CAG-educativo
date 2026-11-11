@@ -1,0 +1,136 @@
+{
+  "corpus": "Cooperativa Nube Alta",
+  "idioma": "es",
+  "descripcion": "Cuatro documentos ficticios de una cooperativa cafetalera. Como todo es inventado, el modelo no puede saber las respuestas de memoria: lo que no salga de los documentos es una alucinación.",
+  "licencia": "Contenido ficticio creado para este proyecto (licencia MIT).",
+  "preguntas": [
+    {
+      "id": "c01",
+      "tipo": "dato_puntual",
+      "pregunta": "¿En qué fecha se fundó la cooperativa?",
+      "respuesta_esperada": "El 14 de marzo de 1987.",
+      "en_documentos": true,
+      "documentos_fuente": ["manual_cooperativa_nube_alta.md"]
+    },
+    {
+      "id": "c02",
+      "tipo": "calculo",
+      "pregunta": "¿Cuántos días de vacaciones tiene un empleado en su tercer año de trabajo?",
+      "respuesta_esperada": "18 días hábiles: 14 el primer año, más 2 por cada año adicional de antigüedad.",
+      "en_documentos": true,
+      "documentos_fuente": ["manual_cooperativa_nube_alta.md"]
+    },
+    {
+      "id": "c03",
+      "tipo": "dato_puntual",
+      "pregunta": "¿Qué puntaje mínimo de catación necesita un lote para clasificarse como 'Reserva Nube'?",
+      "respuesta_esperada": "86 puntos o más.",
+      "en_documentos": true,
+      "documentos_fuente": ["protocolo_calidad_y_catacion.md"]
+    },
+    {
+      "id": "c04",
+      "tipo": "version",
+      "pregunta": "¿Cuánto se pagó por kilogramo de cereza madura de primera en la cosecha 2024?",
+      "respuesta_esperada": "84 pesos por kilogramo.",
+      "en_documentos": true,
+      "documentos_fuente": ["informe_anual_2025.md"]
+    },
+    {
+      "id": "c05",
+      "tipo": "version",
+      "pregunta": "¿Cuánto se pagará por kilogramo de cereza madura de primera en la cosecha 2026?",
+      "respuesta_esperada": "98 pesos por kilogramo.",
+      "en_documentos": true,
+      "documentos_fuente": ["acta_asamblea_enero_2026.md"]
+    },
+    {
+      "id": "c06",
+      "tipo": "version",
+      "pregunta": "Una familia presenta su solicitud para ser socia en abril de 2026. ¿Cuánto debe pagar de cuota de ingreso?",
+      "respuesta_esperada": "2,000 pesos, porque la nueva cuota aplica a las solicitudes presentadas a partir del 1 de marzo de 2026.",
+      "en_documentos": true,
+      "documentos_fuente": ["acta_asamblea_enero_2026.md"]
+    },
+    {
+      "id": "c07",
+      "tipo": "multi_documento",
+      "pregunta": "El lote que obtuvo el segundo lugar en la Taza de Excelencia Sierra Norte 2024, ¿en qué categoría de calidad de la cooperativa entraría por su puntaje?",
+      "respuesta_esperada": "En Reserva Nube: obtuvo 88.25 puntos y esa categoría es para lotes de 86 puntos o más.",
+      "en_documentos": true,
+      "documentos_fuente": ["manual_cooperativa_nube_alta.md", "protocolo_calidad_y_catacion.md"]
+    },
+    {
+      "id": "c08",
+      "tipo": "multi_documento",
+      "pregunta": "¿Cuántas toneladas de Nube Morada se produjeron en 2025 y en qué año se registró esa variedad?",
+      "respuesta_esperada": "83 toneladas en 2025; la variedad se registró en 2011.",
+      "en_documentos": true,
+      "documentos_fuente": ["informe_anual_2025.md", "manual_cooperativa_nube_alta.md"]
+    },
+    {
+      "id": "c09",
+      "tipo": "dato_tabla",
+      "pregunta": "¿A qué países exportó café la cooperativa en 2025 y cuántas toneladas en total?",
+      "respuesta_esperada": "A Japón (95 t), Alemania (80 t), Canadá (50 t) y Chile (35 t): 260 toneladas en total.",
+      "en_documentos": true,
+      "documentos_fuente": ["informe_anual_2025.md"]
+    },
+    {
+      "id": "c10",
+      "tipo": "parafraseo",
+      "pregunta": "Si me lastimo trabajando, ¿a quién tengo que avisar y cuándo?",
+      "respuesta_esperada": "Hay que reportarlo el mismo día a la coordinadora de seguridad, Lucía Hernández Paredes. La brigada de emergencias está en la extensión 110.",
+      "en_documentos": true,
+      "documentos_fuente": ["manual_cooperativa_nube_alta.md"]
+    },
+    {
+      "id": "c11",
+      "tipo": "parafraseo",
+      "pregunta": "¿Qué tan húmedo puede estar el café para poder guardarlo en la bodega?",
+      "respuesta_esperada": "Entre 10.5 % y 11.5 % de humedad. Con más de 12 % no entra a la bodega y regresa a las camas de secado.",
+      "en_documentos": true,
+      "documentos_fuente": ["protocolo_calidad_y_catacion.md"]
+    },
+    {
+      "id": "c12",
+      "tipo": "multi_documento",
+      "pregunta": "¿Cuántas becas Semilla más habrá cada año a partir de 2026, comparado con lo que establece el manual?",
+      "respuesta_esperada": "5 becas más: el manual establece 40 becas al año y la asamblea de enero de 2026 las amplió a 45.",
+      "en_documentos": true,
+      "documentos_fuente": ["manual_cooperativa_nube_alta.md", "acta_asamblea_enero_2026.md"]
+    },
+    {
+      "id": "c13",
+      "tipo": "dato_puntual",
+      "pregunta": "¿Qué herbicida se prohibirá en las fincas y a partir de cuándo?",
+      "respuesta_esperada": "Los herbicidas a base de glifosato, a partir de julio de 2026.",
+      "en_documentos": true,
+      "documentos_fuente": ["acta_asamblea_enero_2026.md"]
+    },
+    {
+      "id": "c14",
+      "tipo": "agregacion",
+      "pregunta": "¿Qué personas ocupan cargos en la cooperativa y cuál es el cargo de cada una?",
+      "respuesta_esperada": "Rosalba Tzompa Méndez (presidenta), Ignacio Pérez Lozano (tesorero desde enero de 2026, en sustitución de Marta Cruz Aguilar), Lucía Hernández Paredes (coordinadora de seguridad), Itzel Romero Vargas (jefa de calidad) y Guadalupe Ixtle Romero (secretaria de actas de la asamblea).",
+      "en_documentos": true,
+      "documentos_fuente": ["manual_cooperativa_nube_alta.md", "acta_asamblea_enero_2026.md", "protocolo_calidad_y_catacion.md"]
+    },
+    {
+      "id": "c15",
+      "tipo": "fuera_del_documento",
+      "pregunta": "¿Cuánto cuesta el envío a domicilio de los productos de la tienda?",
+      "respuesta_esperada": "Esa información no aparece en los documentos.",
+      "en_documentos": false,
+      "documentos_fuente": []
+    },
+    {
+      "id": "c16",
+      "tipo": "fuera_del_documento",
+      "pregunta": "¿Cuál es la capital de Australia?",
+      "respuesta_esperada": "Esa información no aparece en los documentos.",
+      "en_documentos": false,
+      "documentos_fuente": []
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-# 📖 Teoría de CAG en 10 minutos
+# 📖 Teoría de CAG en 12 minutos
 
 > **Cómo leer esto:** cada sección empieza con la idea en una frase (💡). Si solo
 > lees esas frases, ya entiendes lo esencial. Los números entre corchetes, como
@@ -165,12 +165,29 @@ para detectarla usamos un modelo como juez, con evidencia visible.*
   - **Relevancia de la respuesta** (*answer relevance*): se generan preguntas a
     partir de la respuesta y se comparan con la pregunta original. RAGAS las
     compara con *embeddings*; aquí un juez las califica con una rúbrica de 1 a 5.
+- **No le creas al juez sin pruebas.** El juez de veracidad debe copiar la
+  **cita textual** que respalda cada dato, y Python la comprueba: la mayor parte
+  de la cita (el 70 % de sus pares de palabras) y **todas sus cifras** deben
+  existir en los documentos, y la cita debe tener que ver con la afirmación. En
+  nuestras pruebas, sin esta comprobación el juez aprobó una vez *"La capital de
+  Australia es Canberra"* copiando como "evidencia" la etiqueta de un documento.
+  Con ella no volvió a pasar. No exigimos una copia letra por letra porque los
+  modelos casi nunca la hacen: unen renglones de tablas, quitan negritas o
+  cambian comillas. Esa exigencia rechazó muchas respuestas correctas y nos
+  obligó a afinarla. Si el juez describe en vez de citar, el dato cuenta como no
+  respaldado: preferimos ese error, que puedes revisar, a aprobar una
+  alucinación.
 - **LLM-as-a-Judge** [10]: usar un modelo como evaluador. Los jueces fuertes
   coinciden con las personas más del 80 % de las veces, pero tienen **sesgos**:
   prefieren respuestas largas, se dejan influir por el orden y tienden a
   favorecer sus propias respuestas (*autopromoción*). En este proyecto el juez
   es el mismo modelo que respondió, así que **muestra su evidencia y tú tienes
   la última palabra**.
+
+Cuando además **conocemos la respuesta correcta** (como en el banco de pruebas de
+la sección 9), RAGAS propone dos métricas más que usamos aquí: **exactitud**
+(*answer correctness*: ¿coincide con la respuesta correcta?) y **recuperación**
+(*context recall*: ¿el buscador de RAG trajo la información necesaria?).
 
 > 🧩 **Reto para quien quiera más:** tienes instalado `nomic-embed-text`.
 > Implementa la relevancia "como en el artículo": genera las preguntas
@@ -179,7 +196,142 @@ para detectarla usamos un modelo como juez, con evidencia visible.*
 
 ---
 
-## 9. Dónde ver cada idea en este proyecto
+## 9. CAG vs RAG cara a cara
+
+💡 *Para que una comparación enseñe algo, todo debe ser igual excepto lo que
+quieres medir.*
+
+**RAG por dentro** (en `rag_core.py`):
+
+1. **Trocear:** los documentos se cortan en fichas de ~1,200 caracteres, sin
+   mezclar secciones. A cada ficha se le antepone su documento y su sección.
+2. **Embeddings:** `nomic-embed-text` [14] convierte cada ficha en una lista de
+   768 números que representa su significado. Su documentación exige anteponer
+   `search_document:` a las fichas y `search_query:` a las preguntas [15].
+3. **Buscar:** se compara la pregunta con todas las fichas (*similitud coseno*)
+   y se toman las *k* más parecidas (4 por defecto).
+4. **Responder:** el mismo modelo de chat recibe solo esas fichas.
+
+**Las reglas de la pelea justa:** mismos documentos, mismas preguntas (con su
+respuesta correcta conocida), mismo modelo, misma mesa (`num_ctx`), mismo
+razonamiento, temperatura 0 y los mismos jueces. La única diferencia es qué
+texto ve el modelo: todo (CAG) o *k* fichas (RAG).
+
+**Lo que encontramos** (corpus de la cooperativa, `gpt-oss:20b`, k = 4, RTX 5070 Ti):
+
+| 16 preguntas de referencia | 🧠 CAG | 🔎 RAG |
+|---|---|---|
+| Exactitud | **100 %** | 81 % |
+| Veracidad (nada inventado) | **97 %** | 88 % |
+| Preguntas que necesitan 2 documentos (3) | **100 %** | 33 % |
+| Tokens leídos por pregunta | 4,637 | **916** |
+| Tiempo de lectura del prompt | **0.04 s** (desde la caché) | 0.10 s |
+| Tiempo total por pregunta | 4.1 s | **1.3 s** |
+
+- **Empate** en datos puntuales, cálculos, cifras de distintos años, paráfrasis y
+  preguntas trampa (ambos dijeron "no aparece en los documentos").
+- **RAG falla cuando la respuesta está repartida.** En 2 de las 3 preguntas que
+  necesitaban dos documentos, y en la que pedía juntar nombres dispersos, el
+  buscador trajo solo una parte (recuperación del 50 %). En una de ellas RAG
+  **rellenó el hueco inventando**: dijo que una variedad "se registró en 2022",
+  cuando 2022 era el año de unas plantaciones. Es justo el riesgo de la sección 3.
+- **La paradoja de la velocidad.** RAG lee 5 veces menos texto, pero tarda más
+  del doble en leerlo: su prompt cambia en cada pregunta y no aprovecha la
+  caché, mientras que CAG lee todo desde sus apuntes. Aun así, RAG terminó antes
+  porque el modelo escribió mucho menos (196 tokens de media frente a 638,
+  razonamiento incluido): con más contexto, el modelo razonó más.
+- **Los jueces también se equivocan.** En la primera corrida, el juez de
+  exactitud reprobó una respuesta correcta de RAG por añadir un dato extra (que
+  era cierto), y el de veracidad aprobó una vez un dato inventado (sección 8).
+  Ajustamos ambos y repetimos todo. Moraleja: evalúa también al evaluador.
+- **Los números se mueven un poco.** En todas las corridas CAG acertó el 100 %,
+  el RAG clásico entre el 81 % y el 84 %, y el tiempo de CAG fue de 2.2 a 4.1 s:
+  ni el razonamiento ni los jueces son 100 % deterministas.
+
+> ⚠️ Son 16 preguntas, un modelo y un corpus pequeño (~4,600 tokens). Sirve para
+> entender, no como verdad estadística. Con bibliotecas más grandes, la ventaja
+> de RAG al leer menos crece, y también los límites de CAG (sección 7).
+
+**El idioma importa (y CAG no lo sufre):** `nomic-embed-text` se entrenó en
+inglés [14]. En nuestras pruebas, con preguntas y textos en inglés el buscador
+acertó siempre y con márgenes claros. En español falló 2 de 5 veces (por
+ejemplo, con *"si me lastimo"* no encontró *"accidente"*). CAG no tiene ese
+problema porque el modelo lee todo el texto. Por eso las preguntas del corpus
+del paper están en inglés, igual que el paper.
+
+**Sobre los documentos de prueba: citar no es lo mismo que tener permiso.**
+Una cita reconoce la autoría, pero no da permiso para copiar ni redistribuir un
+texto: eso lo decide su **licencia**. El paper de CAG usa CC BY-SA 4.0 [1] [16], que
+permite compartirlo con atribución y con la misma licencia. Aun así, este
+proyecto no lo incluye: lo descarga de arXiv cuando lo pides. El corpus de la
+cooperativa es ficticio y no tiene ese problema; además, como es inventado, el
+modelo no puede "saber" las respuestas de memoria.
+
+---
+
+## 10. Cuatro bibliotecarios: estrategias de RAG
+
+💡 *RAG no es una sola técnica: hay muchas formas de buscar, y cada una arregla
+un fallo distinto (y a veces crea otro).*
+
+El RAG de la sección 9 es el **clásico**. En la página ⚔️ puedes elegir otras
+tres estrategias, todas sobre el mismo fichero:
+
+| Estrategia | Cómo busca | Qué arregla | Su precio |
+|---|---|---|---|
+| 🔎 **Clásico** | Embeddings: las *k* fichas más parecidas en significado | — (es la base) | Falla con nombres, cifras y respuestas repartidas |
+| 🔀 **Híbrido** | Embeddings + **BM25**, que busca palabras exactas y da más peso a las raras [17]. Las dos listas se unen con **RRF** [18] y el modelo reordena las candidatas (*reranking*) [19] | Términos exactos ("Taza de Excelencia", "Nube Morada") | Una llamada extra al modelo (~1.4 s) |
+| 👪 **Padre-hijo** | Busca fichas pequeñas (precisas), pero entrega su documento o su sección (más contexto) [20] | Datos que están en otra parte del mismo documento | Lee mucho más texto: con documentos pequeños se parece a CAG |
+| 🤖 **Agéntico** | El modelo divide la pregunta en búsquedas [21], busca, revisa si le falta algo y vuelve a buscar [22] | Preguntas que piden varios datos | Varias llamadas al modelo (~1.3 s); depende de que planee bien |
+
+**Lo que aprendimos al construirlas** (antes de escribir el código, medimos):
+
+- **Más técnica no siempre es mejor.** El híbrido sin *reranker* encontraba los
+  nombres exactos, pero perdía la pregunta parafraseada (*"si me lastimo"*):
+  BM25 empujaba fuera la ficha correcta. El *reranker* lo resolvió.
+- **El tamaño del "padre" importa.** Entregar la *sección* no mejoró nada aquí,
+  porque nuestras fichas ya son secciones; entregar el *documento* sí. Por eso la
+  estrategia es adaptativa: documento completo si es corto (≤ 6,000 caracteres),
+  solo la sección si es largo.
+- **La agregación sigue siendo difícil.** Ninguna resolvió *"todas las personas
+  con cargo"*: el agente notó que le faltaba algo, pero su búsqueda extra no
+  encontró los nombres dispersos. Ese es el terreno de **Graph RAG** [23], que
+  antes de buscar extrae entidades y relaciones (persona → cargo).
+- **Un modelo que razona puede quedarse dando vueltas.** Con padre-hijo (tres
+  documentos completos) y la pregunta de agregación, el modelo razonó una vez
+  12,800 tokens durante 82 segundos, llenó la mesa y no llegó a responder. No
+  fue determinista: al repetirla respondió en ~22 s. Por eso el proyecto pone un
+  **tope de escritura** (6,144 tokens) y avisa cuando se alcanza, en vez de
+  mostrar una respuesta vacía sin explicación.
+
+**La liga** (las 16 preguntas, cada estrategia contra CAG):
+
+| 16 preguntas | 🧠 CAG | 🔎 Clásico | 🔀 Híbrido | 👪 Padre-hijo | 🤖 Agéntico |
+|---|---|---|---|---|---|
+| **Exactitud** | **100 %** | 84 % | 97 % | 94 % | 97 % |
+| Preguntas de 2 documentos (3) | **100 %** | 33 % | **100 %** | **100 %** | **100 %** |
+| Agregación (1) | **100 %** | 50 % | 50 % | 0 % | 50 % |
+| Recuperación del buscador | — | 89 % | 96 % | 96 % | 96 % |
+| Tokens leídos por pregunta | 4,637 | 916 | 913 | 2,969 | 1,046 |
+| Tiempo por pregunta | 2.2 s | **1.3 s** | 2.6 s | 3.9 s | 2.6 s |
+
+- **Las tres estrategias nuevas cierran casi toda la brecha** (94–97 % frente al
+  84 % del clásico) y resuelven las preguntas de dos documentos. El precio es el
+  tiempo: el híbrido y el agente gastan ~1.3 s extra en llamadas al modelo, y CAG
+  termina antes que ellos.
+- **La agregación sigue siendo de CAG.** Cuando la respuesta está repartida por
+  todo el corpus, leerlo todo gana. Ninguna estrategia de RAG la resolvió.
+- **Padre-hijo está a medio camino.** Lee 3 veces más que el clásico (el 64 % de
+  lo que lee CAG). En las dos corridas de la liga, se quedó dando vueltas en la
+  pregunta de agregación; el tope de escritura la cortó a los 40 s.
+- **La veracidad no se muestra en la tabla porque engaña aquí.** CAG sacó 93 % y
+  el híbrido 100 %, pero revisamos las 4 afirmaciones de CAG que el juez rechazó y
+  **las 4 eran ciertas**: el juez describió o parafraseó en vez de citar. Las
+  respuestas más largas le dan más ocasiones de citar mal.
+
+---
+
+## 11. Dónde ver cada idea en este proyecto
 
 | Concepto | En el código | En la app |
 |---|---|---|
@@ -188,13 +340,22 @@ para detectarla usamos un modelo como juez, con evidencia visible.*
 | Tamaño de la mesa | `calcular_tamano_de_mesa()` → `num_ctx` | Panel ① *Mesa* |
 | Caducidad de la caché | `keep_alive` en `parametros_base()` | Panel ① *Duración de la caché* |
 | Invalidador silencioso | `romper_cache=True` | Barra lateral → 🧨 *Romper la caché* |
-| Truncado silencioso | `RespuestaCAG.prompt_recortado` | Panel ③, alerta roja |
+| Truncado silencioso | `RespuestaDelModelo.prompt_recortado` | Panel ③, alerta roja |
 | Fidelidad | `evaluar_veracidad()` en `evals.py` | Panel ③ ⚖️ |
 | Relevancia | `evaluar_relevancia()` en `evals.py` | Panel ③ 🎯 |
+| Troceado de RAG | `trocear_documento()` en `rag_core.py` | ⚔️ CAG vs RAG → *Fichas en el índice* |
+| Búsqueda por similitud | `MotorRAG.buscar()` | ⚔️ → *Las fichas que trajo el buscador* |
+| Exactitud y recuperación | `evaluar_exactitud()` y `evaluar_recuperacion()` | ⚔️ → *Banco de pruebas* |
+| La pelea justa | `preparar_contendientes()` en `comparacion.py` | ⚔️ → *Prepara a los rivales* |
+| BM25 y fusión RRF | `IndiceBM25` y `fusion_rrf()` en `rag_core.py` | ⚔️ → 🔀 Híbrido |
+| *Reranking* con el modelo | `MotorRAG._reordenar()` | ⚔️ → 🔀 Híbrido → *Lo que hizo el buscador* |
+| Padre-hijo | `MotorRAG._buscar_padre_hijo()` | ⚔️ → 👪 Padre-hijo |
+| Agente que planea y revisa | `MotorRAG._buscar_agentico()` | ⚔️ → 🤖 Agéntico → *paso a paso* |
+| La liga de estrategias | `correr_liga()` en `comparacion.py` | ⚔️ → 🏆 *Liga de estrategias* |
 
 ---
 
-## 10. Glosario exprés
+## 12. Glosario exprés
 
 - **Caché KV:** apuntes internos (claves y valores) que el modelo guarda de lo que ya leyó.
 - **Prefill / lectura:** la fase en la que el modelo procesa el prompt. Es lo que la caché acelera.
@@ -203,6 +364,13 @@ para detectarla usamos un modelo como juez, con evidencia visible.*
 - **`keep_alive`:** cuánto tiempo mantiene Ollama el modelo, y su caché, en memoria.
 - **VRAM:** la memoria de la tarjeta gráfica, donde viven el modelo y su caché.
 - **Embedding:** un texto convertido en una lista de números que representa su significado; RAG los usa para buscar.
+- **Fragmento o ficha (*chunk*):** cada pedazo en que RAG corta los documentos.
+- **Similitud coseno:** qué tan parecidos son dos embeddings (1 = idénticos en significado).
+- **Top-k:** cuántas fichas trae el buscador de RAG en cada pregunta.
+- **BM25:** buscador por palabras exactas; las palabras raras pesan más que las comunes.
+- **RRF (*Reciprocal Rank Fusion*):** forma de unir varias listas ordenadas premiando lo que sale arriba en todas.
+- ***Reranking*:** segunda pasada en la que el modelo lee las candidatas y elige las más útiles.
+- **Agente:** un modelo que decide qué hacer (buscar, revisar, volver a buscar) antes de responder.
 - **Alucinación:** un dato que suena creíble pero no sale de la fuente.
 
 ---
@@ -222,3 +390,13 @@ para detectarla usamos un modelo como juez, con evidencia visible.*
 11. Ollama. *FAQ* (tamaño del contexto, `keep_alive`, peticiones simultáneas): [docs.ollama.com/faq](https://docs.ollama.com/faq) · *Structured outputs*: [docs.ollama.com/capabilities/structured-outputs](https://docs.ollama.com/capabilities/structured-outputs) · *API*: [github.com/ollama/ollama/blob/main/docs/api.md](https://github.com/ollama/ollama/blob/main/docs/api.md)
 12. Ji, Z., Lee, N., Frieske, R., et al. (2023). *Survey of Hallucination in Natural Language Generation.* ACM Computing Surveys. [arXiv:2202.03629](https://arxiv.org/abs/2202.03629)
 13. Anthropic. *Prompt caching* (documentación oficial, ejemplo comercial de la misma idea): [platform.claude.com/docs/en/build-with-claude/prompt-caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+14. Nussbaum, Z., Morris, J. X., Duderstadt, B. y Mulyar, A. (2024). *Nomic Embed: Training a Reproducible Long Context Text Embedder.* Transactions on Machine Learning Research (TMLR). [arXiv:2402.01613](https://arxiv.org/abs/2402.01613)
+15. Nomic AI. *Ficha del modelo nomic-embed-text-v1.5* (prefijos de tarea obligatorios): [huggingface.co/nomic-ai/nomic-embed-text-v1.5](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5)
+16. Creative Commons. *Atribución-CompartirIgual 4.0 Internacional (CC BY-SA 4.0)*: [creativecommons.org/licenses/by-sa/4.0/deed.es](https://creativecommons.org/licenses/by-sa/4.0/deed.es)
+17. Robertson, S. y Zaragoza, H. (2009). *The Probabilistic Relevance Framework: BM25 and Beyond.* Foundations and Trends in Information Retrieval, 3(4), 333–389. DOI: [10.1561/1500000019](https://doi.org/10.1561/1500000019)
+18. Cormack, G. V., Clarke, C. L. A. y Büttcher, S. (2009). *Reciprocal Rank Fusion outperforms Condorcet and individual rank learning methods.* SIGIR 2009, pp. 758–759. DOI: [10.1145/1571941.1572114](https://doi.org/10.1145/1571941.1572114)
+19. Sun, W., Yan, L., Ma, X., et al. (2023). *Is ChatGPT Good at Search? Investigating Large Language Models as Re-Ranking Agents.* EMNLP 2023. [arXiv:2304.09542](https://arxiv.org/abs/2304.09542)
+20. Chen, T., Wang, H., Chen, S., et al. (2024). *Dense X Retrieval: What Retrieval Granularity Should We Use?* EMNLP 2024, pp. 15159–15177. [ACL Anthology](https://aclanthology.org/2024.emnlp-main.845/)
+21. Press, O., Zhang, M., Min, S., Schmidt, L., Smith, N. A. y Lewis, M. (2023). *Measuring and Narrowing the Compositionality Gap in Language Models* (método *Self-Ask*). Findings of EMNLP 2023. [arXiv:2210.03350](https://arxiv.org/abs/2210.03350)
+22. Asai, A., Wu, Z., Wang, Y., Sil, A. y Hajishirzi, H. (2024). *Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection.* ICLR 2024. [arXiv:2310.11511](https://arxiv.org/abs/2310.11511)
+23. Edge, D., Trinh, H., Cheng, N., et al. (2024). *From Local to Global: A Graph RAG Approach to Query-Focused Summarization.* Preprint. [arXiv:2404.16130](https://arxiv.org/abs/2404.16130)
